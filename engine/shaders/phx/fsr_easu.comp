@@ -1,0 +1,27 @@
+#version 460
+#include "bindless.glsl"
+#include "aa_common.glsl"
+// AMD FidelityFX Super Resolution 1 — EASU (edge-adaptive spatial upsampling), render →
+// output resolution, on the TAA result.
+layout(push_constant, scalar) uniform Push {
+    uvec4 con[4];     // FsrEasuCon
+    uint historySlot; // TAA history slot to read
+} pc;
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx_a.h"
+uint gInput;
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p) { vec4 r = textureGather(gTextures[gInput], p, 0); return r / (1.0 + r); }
+AF4 FsrEasuGF(AF2 p) { vec4 g = textureGather(gTextures[gInput], p, 1); return g / (1.0 + g); }
+AF4 FsrEasuBF(AF2 p) { vec4 b = textureGather(gTextures[gInput], p, 2); return b / (1.0 + b); }
+#include "ffx_fsr1.h"
+layout(local_size_x = 8, local_size_y = 8) in;
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(p, uvec2(imageSize(gStorage[STOR_EASU]))))) return;
+    gInput = TEX_HISTORY0 + pc.historySlot;
+    AF3 c;
+    FsrEasuF(c, p, pc.con[0], pc.con[1], pc.con[2], pc.con[3]);
+    imageStore(gStorage[STOR_EASU], ivec2(p), vec4(aaExpand(clamp(c, 0.0, 0.9999)), 1.0));
+}

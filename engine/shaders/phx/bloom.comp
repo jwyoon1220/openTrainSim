@@ -1,0 +1,63 @@
+#version 460
+#include "bindless.glsl"
+// Bloom (glare of bright light in the eye / lens), Jimenez 2014 style mip chain at half
+// output resolution and below.
+//  pc.mode: 0 = first downsample from the HDR scene (Karis average against fireflies),
+//                1 = downsample (13-tap), 2 = upsample (3×3 tent) added onto the level
+//  pc.level: destination level; source = level − 1 (down) or level + 1 (up)
+layout(push_constant, scalar) uniform Push { uint mode; uint level; } pc;
+layout(local_size_x = 8, local_size_y = 8) in;
+
+const float kBloomInputMax = 24.0; // × white
+
+float karisWeight(vec3 c) { return 1.0 / (1.0 + dot(c, vec3(0.2126, 0.7152, 0.0722))); }
+
+void main() {
+    uint mode = pc.mode, level = pc.level;
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 size = imageSize(gStorage[STOR_BLOOM0 + level]);
+    if (any(greaterThanEqual(p, size))) return;
+    vec2 uv = (vec2(p) + 0.5) / vec2(size);
+
+    if (mode == 2u) {
+        uint src = TEX_BLOOM0 + level + 1u;
+        vec2 t = 1.0 / vec2(textureSize(gTextures[src], 0));
+        vec3 up = (texture(gTextures[src], uv + vec2(-t.x, -t.y)).rgb + texture(gTextures[src], uv + vec2(t.x, -t.y)).rgb +
+                   texture(gTextures[src], uv + vec2(-t.x, t.y)).rgb + texture(gTextures[src], uv + vec2(t.x, t.y)).rgb) +
+                  (texture(gTextures[src], uv + vec2(0, -t.y)).rgb + texture(gTextures[src], uv + vec2(0, t.y)).rgb +
+                   texture(gTextures[src], uv + vec2(-t.x, 0)).rgb + texture(gTextures[src], uv + vec2(t.x, 0)).rgb) * 2.0 +
+                  texture(gTextures[src], uv).rgb * 4.0;
+        vec3 here = imageLoad(gStorage[STOR_BLOOM0 + level], p).rgb;
+        imageStore(gStorage[STOR_BLOOM0 + level], p, vec4(here + up / 16.0, 1.0));
+        return;
+    }
+
+    uint src = mode == 0u ? TEX_HDR : TEX_BLOOM0 + level - 1u;
+    vec2 t = 1.0 / vec2(textureSize(gTextures[src], 0));
+    // 13 taps: centre box + four overlapping corner boxes.
+    vec3 a = texture(gTextures[src], uv + t * vec2(-2, -2)).rgb, b = texture(gTextures[src], uv + t * vec2(0, -2)).rgb;
+    vec3 c = texture(gTextures[src], uv + t * vec2(2, -2)).rgb, d = texture(gTextures[src], uv + t * vec2(-2, 0)).rgb;
+    vec3 e = texture(gTextures[src], uv).rgb, f = texture(gTextures[src], uv + t * vec2(2, 0)).rgb;
+    vec3 g = texture(gTextures[src], uv + t * vec2(-2, 2)).rgb, h = texture(gTextures[src], uv + t * vec2(0, 2)).rgb;
+    vec3 i = texture(gTextures[src], uv + t * vec2(2, 2)).rgb, j = texture(gTextures[src], uv + t * vec2(-1, -1)).rgb;
+    vec3 k = texture(gTextures[src], uv + t * vec2(1, -1)).rgb, l = texture(gTextures[src], uv + t * vec2(-1, 1)).rgb;
+    vec3 m = texture(gTextures[src], uv + t * vec2(1, 1)).rgb;
+    vec3 boxes[5] = vec3[]((j + k + l + m) * 0.25, (a + b + d + e) * 0.25, (b + c + e + f) * 0.25, (d + e + g + h) * 0.25,
+                           (e + f + h + i) * 0.25);
+    const float w[5] = float[](0.5, 0.125, 0.125, 0.125, 0.125);
+    vec3 sum = vec3(0.0);
+    float wsum = 0.0;
+    for (int n = 0; n < 5; ++n) {
+        float ww = w[n] * (mode == 0u ? karisWeight(boxes[n]) : 1.0);
+        sum += boxes[n] * ww;
+        wsum += ww;
+    }
+    vec3 col = sum / wsum;
+    // The sun disk is ~10^4× white after exposure: its full energy would turn the glare
+    // into a disc filling the sky. Cap the luminance entering the chain (eye glare saturates).
+    if (mode == 0u) {
+        float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
+        col *= min(1.0, kBloomInputMax / max(lum, 1e-6));
+    }
+    imageStore(gStorage[STOR_BLOOM0 + level], p, vec4(col, 1.0));
+}

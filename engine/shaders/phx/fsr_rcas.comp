@@ -1,0 +1,27 @@
+#version 460
+#include "bindless.glsl"
+#include "aa_common.glsl"
+// AMD FidelityFX Super Resolution 1 — RCAS (robust contrast-adaptive sharpening) at output
+// resolution; input = EASU output (FSR modes) or the TAA history (TAA mode, counters TAA
+// softness).
+layout(push_constant, scalar) uniform Push {
+    uvec4 con;  // FsrRcasCon
+    uint src;   // sampled slot of the input
+} pc;
+#define A_GPU 1
+#define A_GLSL 1
+#include "ffx_a.h"
+uint gInput;
+#define FSR_RCAS_F 1
+AF4 FsrRcasLoadF(ASU2 p) { vec4 c = texelFetch(gTextures[gInput], ivec2(p), 0); return vec4(aaCompress(c.rgb), 1.0); }
+void FsrRcasInputF(inout AF1 r, inout AF1 g, inout AF1 b) {}
+#include "ffx_fsr1.h"
+layout(local_size_x = 8, local_size_y = 8) in;
+void main() {
+    uvec2 p = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(p, uvec2(imageSize(gStorage[STOR_AA_OUT]))))) return;
+    gInput = pc.src;
+    AF1 r, g, b;
+    FsrRcasF(r, g, b, p, pc.con);
+    imageStore(gStorage[STOR_AA_OUT], ivec2(p), vec4(aaExpand(clamp(vec3(r, g, b), 0.0, 0.9999)), 1.0));
+}

@@ -1,0 +1,6 @@
+cmake-build-*/
+build*/
+data/
+khsr.zip
+.idea/workspace.xml
+.cache/
