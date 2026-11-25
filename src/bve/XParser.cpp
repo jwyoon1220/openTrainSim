@@ -16,7 +16,7 @@ namespace ots {
 namespace {
 
 struct Token {
-    enum Kind { Ident, Number, String, Open, Close, Sep, End } kind = End;
+    enum class Kind : u8 { Ident, Number, String, Open, Close, Sep, End } kind = Kind::End;
     std::string text;
     double number = 0.0;
 };
@@ -35,12 +35,12 @@ public:
             break;
         }
         const char c = s_[p_];
-        if (c == '{') return ++p_, Token{Token::Open, "{"};
-        if (c == '}') return ++p_, Token{Token::Close, "}"};
-        if (c == ';' || c == ',') return ++p_, Token{Token::Sep, std::string(1, c)};
+        if (c == '{') return ++p_, Token{Token::Kind::Open, "{"};
+        if (c == '}') return ++p_, Token{Token::Kind::Close, "}"};
+        if (c == ';' || c == ',') return ++p_, Token{Token::Kind::Sep, std::string(1, c)};
         if (c == '"') {
             const std::size_t e = s_.find('"', p_ + 1);
-            Token t{Token::String, std::string(s_.substr(p_ + 1, (e == std::string_view::npos ? s_.size() : e) - p_ - 1))};
+            Token t{Token::Kind::String, std::string(s_.substr(p_ + 1, (e == std::string_view::npos ? s_.size() : e) - p_ - 1))};
             p_ = e == std::string_view::npos ? s_.size() : e + 1;
             return t;
         }
@@ -54,8 +54,8 @@ public:
             while (e < s_.size() && (std::isdigit(static_cast<unsigned char>(s_[e])) || s_[e] == '.' || s_[e] == 'e' || s_[e] == 'E' ||
                                      ((s_[e] == '-' || s_[e] == '+') && (s_[e - 1] == 'e' || s_[e - 1] == 'E'))))
                 ++e;
-            Token t{Token::Number, std::string(s_.substr(p_, e - p_))};
-            parseDouble(t.text, t.number);
+            Token t{Token::Kind::Number, std::string(s_.substr(p_, e - p_))};
+            t.number = parseDouble(t.text).value_or(t.number);
             p_ = e;
             return t;
         }
@@ -64,7 +64,7 @@ public:
                s_[e] != ',')
             ++e;
         if (e == p_) ++e;
-        Token t{Token::Ident, std::string(s_.substr(p_, e - p_))};
+        Token t{Token::Kind::Ident, std::string(s_.substr(p_, e - p_))};
         p_ = e;
         return t;
     }
@@ -86,8 +86,8 @@ class Parser {
 public:
     explicit Parser(std::string_view s) : lex_(s) { tok_ = lex_.next(); }
     void parseTop(std::vector<std::unique_ptr<Node>>& out) {
-        while (tok_.kind != Token::End) {
-            if (tok_.kind == Token::Ident) {
+        while (tok_.kind != Token::Kind::End) {
+            if (tok_.kind == Token::Kind::Ident) {
                 if (auto n = parseObject()) out.push_back(std::move(n));
             } else {
                 advance();
@@ -105,38 +105,38 @@ private:
         auto n = std::make_unique<Node>();
         n->type = lower(tok_.text);
         advance();
-        if (tok_.kind == Token::Ident) {
+        if (tok_.kind == Token::Kind::Ident) {
             n->name = tok_.text;
             advance();
         }
-        if (tok_.kind != Token::Open) return nullptr;
+        if (tok_.kind != Token::Kind::Open) return nullptr;
         advance();
         const bool isTemplate = n->type == "template";
         int depth = 0;
-        while (tok_.kind != Token::End) {
-            if (tok_.kind == Token::Close) {
+        while (tok_.kind != Token::Kind::End) {
+            if (tok_.kind == Token::Kind::Close) {
                 advance();
                 if (depth == 0) break;
                 --depth;
                 continue;
             }
             if (isTemplate) {
-                if (tok_.kind == Token::Open) ++depth;
+                if (tok_.kind == Token::Kind::Open) ++depth;
                 advance();
                 continue;
             }
             switch (tok_.kind) {
-            case Token::Number: n->numbers.push_back(tok_.number); advance(); break;
-            case Token::String: n->strings.push_back(tok_.text); advance(); break;
-            case Token::Sep: advance(); break;
-            case Token::Open: { // reference { Name }
+            case Token::Kind::Number: n->numbers.push_back(tok_.number); advance(); break;
+            case Token::Kind::String: n->strings.push_back(tok_.text); advance(); break;
+            case Token::Kind::Sep: advance(); break;
+            case Token::Kind::Open: { // reference { Name }
                 advance();
-                if (tok_.kind == Token::Ident) n->refs.push_back(tok_.text), advance();
-                while (tok_.kind != Token::Close && tok_.kind != Token::End) advance();
+                if (tok_.kind == Token::Kind::Ident) n->refs.push_back(tok_.text), advance();
+                while (tok_.kind != Token::Kind::Close && tok_.kind != Token::Kind::End) advance();
                 advance();
                 break;
             }
-            case Token::Ident: {
+            case Token::Kind::Ident: {
                 if (auto c = parseObject()) n->children.push_back(std::move(c));
                 break;
             }
@@ -267,20 +267,12 @@ struct Loader {
 
 } // namespace
 
-bool loadX(const std::filesystem::path& path, StaticMesh& out, std::string& error) {
-    std::string text;
-    if (!readTextFile(path, text)) {
-        error = "cannot read";
-        return false;
-    }
-    if (text.size() < 16 || text.compare(0, 3, "xof") != 0) {
-        error = "not an X file";
-        return false;
-    }
-    if (text.compare(8, 3, "txt") != 0) {
-        error = "binary/compressed X files are not supported";
-        return false;
-    }
+Expected<StaticMesh> loadX(const std::filesystem::path& path) {
+    const auto file = readTextFile(path);
+    if (!file) return Unexpected("cannot read");
+    const std::string& text = *file;
+    if (text.size() < 16 || !text.starts_with("xof")) return Unexpected("not an X file");
+    if (text.compare(8, 3, "txt") != 0) return Unexpected("binary/compressed X files are not supported");
     std::vector<std::unique_ptr<Node>> top;
     Parser(std::string_view(text).substr(16)).parseTop(top);
     Loader l;
@@ -289,9 +281,8 @@ bool loadX(const std::filesystem::path& path, StaticMesh& out, std::string& erro
         if (n->type == "material" && !n->name.empty()) l.namedMaterials[n->name] = n.get();
     for (const auto& n : top) l.walk(*n, glm::mat4(1.0f));
     mergeParts(l.out);
-    out = std::move(l.out);
-    if (!l.error.empty()) error = l.error;
-    return true;
+    l.out.warning = l.error;
+    return std::move(l.out);
 }
 
 } // namespace ots

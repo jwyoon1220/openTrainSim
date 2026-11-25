@@ -18,6 +18,8 @@ class TrainSim {
 public:
     TrainSim(const TrainDef& def, const Route& route);
     void placeAt(double frontTrackPosition);
+    // Moves the train without touching its speed (collision clamp).
+    void setFront(double frontTrackPosition);
     void command(Command c);
     void update(double dt);
 
@@ -58,7 +60,10 @@ public:
     [[nodiscard]] int maxBrake() const { return def_.spec.driverBrakeNotches; }
     [[nodiscard]] bool doorsClosed() const { return leftDoors == 0.0 && rightDoors == 0.0 && !leftDoorsTarget && !rightDoorsTarget; }
     // Eye position / orientation of the driver (world).
-    void driverPose(glm::dvec3& pos, glm::dvec3& X, glm::dvec3& Y, glm::dvec3& Z) const;
+    struct DriverView {
+        glm::dvec3 position, X, Y, Z; // right, up, forward
+    };
+    [[nodiscard]] DriverView driverPose() const;
 
 private:
     void updateCars();

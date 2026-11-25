@@ -2,6 +2,7 @@
 
 #include "util/Text.hpp"
 
+#include <array>
 #include <cmath>
 #include <random>
 #include <unordered_map>
@@ -26,7 +27,7 @@ const std::unordered_map<std::string, Var>& variableNames() {
         {"locobrakenotches", Var::LocoBrakeNotches}, {"emergencybrake", Var::EmergencyBrake},
         {"hasairbrake", Var::HasAirBrake}, {"holdbrake", Var::HoldBrake}, {"hasholdbrake", Var::HasHoldBrake},
         {"constspeed", Var::ConstSpeed}, {"hasconstspeed", Var::HasConstSpeed}, {"hasplugin", Var::HasPlugin},
-        {"pluginstate", Var::PluginState}, {"mainreservoir", Var::MainReservoir}, {"emergencyreservoir", Var::EmergencyReservoir},
+        {"pluginstate", Var::PluginState}, {"safety", Var::Safety}, {"mainreservoir", Var::MainReservoir}, {"emergencyreservoir", Var::EmergencyReservoir},
         {"brakepipe", Var::BrakePipe}, {"brakecylinder", Var::BrakeCylinder}, {"straightairpipe", Var::StraightAirPipe},
         {"equalizingreservoir", Var::EqualizingReservoir}, {"section", Var::Section}, {"klaxon", Var::Klaxon},
         {"primaryklaxon", Var::PrimaryKlaxon}, {"secondaryklaxon", Var::SecondaryKlaxon}, {"musicklaxon", Var::MusicKlaxon},
@@ -212,13 +213,13 @@ private:
             while (e < s_.size() && ((s_[e] >= '0' && s_[e] <= '9') || s_[e] == '.' || s_[e] == 'e' || s_[e] == 'E' ||
                                      ((s_[e] == '-' || s_[e] == '+') && e > p_ && (s_[e - 1] == 'e' || s_[e - 1] == 'E'))))
                 ++e;
-            double v;
-            if (!parseDouble(s_.substr(p_, e - p_), v)) {
+            const auto v = parseDouble(s_.substr(p_, e - p_));
+            if (!v) {
                 error_ = "invalid number " + std::string(s_.substr(p_, e - p_));
                 return false;
             }
             p_ = e;
-            emit(Function::Op::Const, 0, 0, v);
+            emit(Function::Op::Const, 0, 0, *v);
             return true;
         }
         if (std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
@@ -299,11 +300,11 @@ std::shared_ptr<Function> Function::compile(std::string_view infix, std::string*
 }
 
 double Function::evaluate(const FunctionContext& ctx, double delta) {
-    double stack[64];
-    int sp = 0;
+    std::array<double, 64> stack; // a malformed program reads 0 instead of underflowing
+    std::size_t sp = 0;
     auto pop = [&]() -> double { return sp > 0 ? stack[--sp] : 0.0; };
     auto push = [&](double v) {
-        if (sp < 64) stack[sp++] = v;
+        if (sp < stack.size()) stack[sp++] = v;
     };
     static thread_local std::mt19937 rng{12345u};
     delta_ = delta;

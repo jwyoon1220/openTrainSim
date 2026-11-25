@@ -1,6 +1,6 @@
 #pragma once
 // Bindless slots reserved by the engine's post-processing modules (Upscaler, AntiAliasing,
-// Bloom). Mirrors engine/shaders/phx/post_slots.glsl.
+// Bloom, Ssao). Mirrors engine/shaders/phx/post_slots.glsl.
 //
 // The engine owns sampled slots [kEngineSampledBegin, Bindless::kMaxSampled) and storage
 // slots [kEngineStorageBegin, Bindless::kMaxStorage); a game is free to use everything
@@ -23,12 +23,15 @@ enum PostSlot : u32 {
     kTexLdr = 1006,      // tonemapped image (FXAA input)
     kTexMotion = 1007,   // game: motion vectors, render resolution, previous − current (UV)
     kTexBloom0 = 1008,   // + level (Bloom::kLevels)
+    kTexAo = 1016,       // Ssao: raw ambient occlusion (render resolution)
     // Storage (gStorage, rgba16f)
     kStorMotion = 48,    // game: motion vector output
     kStorHistory0 = 49,  // + 0/1
     kStorEasu = 51,
     kStorAAOut = 52,
     kStorBloom0 = 53,    // + level
+    kStorAo = 60,        // Ssao: raw ambient occlusion
+    kStorAoTarget = 61,  // game: render-resolution HDR scene the occlusion is applied to (Ssao)
 };
 
 } // namespace phx

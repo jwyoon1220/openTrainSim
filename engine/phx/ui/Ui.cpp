@@ -1,4 +1,5 @@
 #include "phx/ui/Ui.hpp"
+#include "phx/ui/Font.hpp"
 
 #include <algorithm>
 
@@ -261,6 +262,8 @@ void Ui::windowHidden(Window &window) {
 }
 
 bool Ui::build(std::vector<Vertex> &out) {
+    if (fonts().generation() != fontGeneration_) // atlas cleared: cached glyph UVs are stale
+        dirty_ = true;
     if (!dirty_)
         return false;
     out.clear();
@@ -269,8 +272,8 @@ bool Ui::build(std::vector<Vertex> &out) {
         w->paintTree(painter);
     if (popup_) {
         painter.pushClip({0, 0, screen_.w, screen_.h});
-        painter.fillRect(popupRect_, theme_.window);
-        painter.drawBorder(popupRect_, theme_.border);
+        painter.fillRoundedRect(popupRect_, theme_.cornerRadius, theme_.window);
+        painter.strokeRoundedRect(popupRect_, theme_.cornerRadius, 1.0f, theme_.border);
         const int rows = static_cast<int>(popupRect_.h / theme_.rowHeight);
         for (int row = 0; row < rows; ++row) {
             const int index = popupFirst_ + row;
@@ -286,6 +289,7 @@ bool Ui::build(std::vector<Vertex> &out) {
         painter.popClip();
     }
     dirty_ = false;
+    fontGeneration_ = fonts().generation(); // after painting: painting may itself clear the atlas
     ++revision_;
     return true;
 }

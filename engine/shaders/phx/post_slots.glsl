@@ -9,9 +9,12 @@
 #define TEX_LDR       1006
 #define TEX_MOTION    1007
 #define TEX_BLOOM0    1008
+#define TEX_AO        1016
 #define STOR_MOTION   48
 #define STOR_HISTORY0 49
 #define STOR_EASU     51
 #define STOR_AA_OUT   52
 #define STOR_BLOOM0   53
+#define STOR_AO       60
+#define STOR_AO_TARGET 61
 #endif

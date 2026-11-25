@@ -1,0 +1,19 @@
+// 경부고속선 KTX123 예제: 노선 파일 옆에 KTX123.terrain.json으로 두거나 --terrain으로 지정합니다.
+// 역 좌표는 대략값입니다. 기준점은 역마다 하나씩 두는 것이 좋습니다 (docs/terrain.md).
+{
+  "anchors": [
+    { "station": "seoul",        "lat": 37.5547, "lon": 126.9707 },
+    { "station": "yongsan",      "lat": 37.5299, "lon": 126.9648 },
+    { "station": "yeongdeungpo", "lat": 37.5157, "lon": 126.9073 },
+    { "station": "gwangmyeong",  "lat": 37.4163, "lon": 126.8848 },
+    { "station": "cheonan",      "lat": 36.7945, "lon": 127.1046 },
+    { "station": "osong",        "lat": 36.6202, "lon": 127.3272 },
+    { "station": "daejeon",      "lat": 36.3326, "lon": 127.4342 },
+    { "station": "gimcheon",     "lat": 36.1135, "lon": 128.1810 },
+    { "station": "dongdaegu",    "lat": 35.8794, "lon": 128.6286 },
+    { "station": "gyeongju",     "lat": 35.7983, "lon": 129.1390 },
+    { "station": "ulsan",        "lat": 35.5519, "lon": 129.1386 },
+    { "station": "busan",        "lat": 35.1150, "lon": 129.0416 }
+  ],
+  "width": 1500
+}

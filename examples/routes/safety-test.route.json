@@ -1,0 +1,49 @@
+// 보안장치 시험선: openTrainSim 자체 노선 형식 (docs/route-format.md)
+// 선로·신호기·승강장은 코드로 만들어지므로 외부 오브젝트가 필요 없습니다.
+{
+  "name": "보안장치 시험선",
+  "length": 20000,                          // m
+  "train": "../trains/test-emu",            // 기본 열차 (--train 으로 바꿀 수 있음)
+  "startTime": "09:00:00",
+
+  // 평면 곡선: at 부터 다음 항목까지. radius 양수 = 오른쪽, 0 = 직선. cant 는 mm
+  "curves": [
+    { "at": 0, "radius": 0 },
+    { "at": 2500, "radius": 1200, "cant": 100 },
+    { "at": 3500, "radius": 0 },
+    { "at": 7000, "radius": -800, "cant": 120 },
+    { "at": 7800, "radius": 0 },
+    { "at": 12500, "radius": 2000, "cant": 60 },
+    { "at": 14000, "radius": 0 }
+  ],
+  // 종단 구배 (permille, 오르막 양수)
+  "grades": [
+    { "at": 0, "permille": 0 },
+    { "at": 4000, "permille": 6 },
+    { "at": 6000, "permille": 0 },
+    { "at": 11000, "permille": -8 },
+    { "at": 12500, "permille": 0 }
+  ],
+  "speedLimits": [
+    { "at": 0, "kmh": 60 },
+    { "at": 600, "kmh": 110 },
+    { "at": 9200, "kmh": 80 },
+    { "at": 10400, "kmh": 110 },
+    { "at": 19000, "kmh": 60 }
+  ],
+  // at = 정지 위치(열차 앞). platform: left / right / both
+  "stations": [
+    { "name": "시험", "at": 300, "departure": "09:01:00", "platform": "right" },
+    { "name": "중간", "at": 9800, "arrival": "09:08:30", "departure": "09:09:30", "platform": "left" },
+    { "name": "종착", "at": 19500, "arrival": "09:17:00", "terminal": true, "platform": "right" }
+  ],
+  // 자동폐색 신호: 1200 m 간격 + 역 출발신호. 현시 0 R, 1 YY, 2 Y, 3 YG, 4 G (5현시)
+  "signals": { "aspects": [0, 1, 2, 3, 4], "spacing": 1200, "side": "left" },
+  // 열차방호장치 구역: 일반선 ATS → 한국형 ATP → 고속선 TVM430 (구역이 바뀌면 운전실에서 확인)
+  "safety": [
+    { "at": 0, "system": "ats" },
+    { "at": 6000, "system": "atp" },
+    { "at": 13000, "system": "tvm430" }
+  ],
+  "environment": { "sunElevation": 42, "sunAzimuth": 150 }
+}

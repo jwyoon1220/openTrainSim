@@ -1,12 +1,12 @@
 #pragma once
-// RIFF/WAVE decoder for train and route sounds. Everything is converted to 16-bit signed mono
+// RIFF/WAVE decoder. Everything is converted to 16-bit signed mono
 // (stereo / multichannel is averaged) so OpenAL can spatialise it.
 #include <cstdint>
 #include <filesystem>
 #include <string>
 #include <vector>
 
-namespace ots {
+namespace phx {
 
 struct PcmMono16 {
     std::vector<int16_t> samples;
@@ -22,4 +22,4 @@ struct PcmMono16 {
 bool decodeWav(const std::vector<uint8_t>& bytes, PcmMono16& out, std::string& error);
 bool loadWav(const std::filesystem::path& file, PcmMono16& out, std::string& error);
 
-} // namespace ots
+} // namespace phx

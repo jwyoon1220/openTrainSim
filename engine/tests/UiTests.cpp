@@ -1,3 +1,4 @@
+#include "phx/ui/Font.hpp"
 #include "phx/ui/Ui.hpp"
 
 #include <cmath>
@@ -20,6 +21,109 @@ static bool near(f32 a, f32 b) {
 struct TestContainer : Container {
     using Container::hitTest;
 };
+
+static u32 alphaAt(const std::vector<Vertex> &vs, f32 x, f32 y) { // alpha of the vertex nearest (x, y)
+    const Vertex *best = nullptr;
+    f32 bd = 1e30f;
+    for (const Vertex &v : vs) {
+        const f32 d = (v.x - x) * (v.x - x) + (v.y - y) * (v.y - y);
+        if (d < bd)
+            bd = d, best = &v;
+    }
+    return best ? best->rgba >> 24u : 0;
+}
+
+static void vectorTests() {
+    Theme theme;
+    std::vector<Vertex> vs;
+    Painter p(vs, theme, {0, 0, 400, 400});
+    const u32 red = rgba(255, 0, 0);
+    // convex fill: triangles, opaque core, transparent 1-px fringe half a pixel outside
+    p.fillRoundedRect({100, 100, 80, 40}, 10, red);
+    CHECK(!vs.empty() && vs.size() % 3 == 0);
+    {
+        std::vector<Vertex> sq;
+        Painter q(sq, theme, {0, 0, 400, 400});
+        const Point square[4] = {{100, 100}, {180, 100}, {180, 140}, {100, 140}};
+        q.fillConvex(square, red);
+        CHECK(alphaAt(sq, 100.5f, 100.5f) == 255); // corner, half a pixel inside: opaque
+        CHECK(alphaAt(sq, 99.5f, 99.5f) == 0);     // half a pixel outside: transparent
+    }
+    f32 minX = 1e9f, maxX = -1e9f;
+    for (const Vertex &v : vs)
+        minX = std::min(minX, v.x), maxX = std::max(maxX, v.x);
+    CHECK(near(minX, 99.5f) && near(maxX, 180.5f));
+    // both windings fill the same way
+    vs.clear();
+    const Point cw[3] = {{0, 0}, {10, 0}, {0, 10}}, ccw[3] = {{0, 0}, {0, 10}, {10, 0}};
+    p.fillConvex(cw, red);
+    const std::size_t n = vs.size();
+    std::vector<Vertex> a = vs;
+    vs.clear();
+    p.fillConvex(ccw, red);
+    CHECK(vs.size() == n);
+    f32 ax = 1e9f, bx = 1e9f;
+    for (const Vertex &v : a)
+        ax = std::min(ax, v.x);
+    for (const Vertex &v : vs)
+        bx = std::min(bx, v.x);
+    CHECK(near(ax, bx) && ax < 0); // fringe outside in both cases
+    // strokes: an open line has a core, fringes and caps; hairlines fade instead of thinning
+    vs.clear();
+    p.drawLine({10, 10}, {110, 10}, 4, red);
+    CHECK(!vs.empty() && vs.size() % 3 == 0);
+    CHECK(alphaAt(vs, 60, 11.5f) == 255 && alphaAt(vs, 60, 12.5f) == 0);
+    vs.clear();
+    p.drawLine({10, 10}, {110, 10}, 0.5f, red);
+    CHECK(alphaAt(vs, 60, 10) < 255 && alphaAt(vs, 60, 10) > 100);
+    // degenerate input draws nothing
+    vs.clear();
+    const Point one[1] = {{5, 5}};
+    p.strokePolyline(one, 2, red);
+    p.fillConvex(one, red);
+    p.fillRoundedRect({0, 0, 50, 50}, 5, rgba(0, 0, 0, 0));
+    CHECK(vs.empty());
+    // the current clip travels with every vertex
+    p.pushClip({20, 30, 40, 50});
+    p.fillCircle({40, 50}, 30, red);
+    for (const Vertex &v : vs)
+        CHECK(v.clipMin == (20u | (30u << 16)) && v.clipMax == (60u | (80u << 16)));
+    p.popClip();
+    // arcs and sectors
+    vs.clear();
+    p.strokeArc({200, 200}, 50, 0, 3.14159f, 3, red);
+    p.fillSector({200, 200}, 20, 50, 0, 1.5f, red);
+    CHECK(!vs.empty() && vs.size() % 3 == 0);
+}
+
+static void fontTests() {
+    std::size_t i = 0;
+    const std::string_view s = "A\xea\xb0\x80\xe2\x82\xac\xff"; // A, 가, €, invalid
+    CHECK(decodeUtf8(s, i) == 'A');
+    CHECK(decodeUtf8(s, i) == 0xAC00);
+    CHECK(decodeUtf8(s, i) == 0x20AC);
+    CHECK(decodeUtf8(s, i) == 0xFFFD && i == s.size());
+    i = 0;
+    CHECK(decodeUtf8(std::string_view("\xea\xb0", 2), i) == 0xFFFD); // truncated
+    FontAtlas &f = fonts();
+    if (!f.available()) {
+        std::puts("(no system font: TrueType tests skipped)");
+        return;
+    }
+    CHECK(f.measure("iiii", 20) < f.measure("WWWW", 20)); // proportional
+    CHECK(near(f.measure("AB", 20) * 2, f.measure("AB", 40)) || std::abs(f.measure("AB", 20) * 2 - f.measure("AB", 40)) < 2);
+    std::vector<GlyphQuad> q;
+    const f32 end = f.layout(10, 50, "Hi", 24, q);
+    CHECK(q.size() == 2 && end > 10 && q[0].y1 <= 51 && q[0].y0 < 50); // glyphs above the baseline
+    CHECK(q[0].u1 > q[0].u0 && q[0].v1 > q[0].v0);
+    (void)f.takeDirty();
+    q.clear();
+    f.layout(0, 50, "Hi", 24, q); // cached: nothing new rasterised
+    CHECK(f.takeDirty().empty());
+    f.layout(0, 50, "Hi", 25, q); // another size: new glyphs
+    CHECK(!f.takeDirty().empty());
+    CHECK(f.pixels()[1 * FontAtlas::kSize + 1] == 255); // white texel for solid fills
+}
 
 static void layoutTests() {
     TestContainer border;
@@ -137,7 +241,7 @@ int main() {
     std::vector<Vertex> vertices;
     CHECK(ui.build(vertices));
     CHECK(!vertices.empty());
-    CHECK(vertices.size() % 4 == 0);
+    CHECK(vertices.size() % 3 == 0); // triangle list
     const std::size_t oldSize = vertices.size();
     CHECK(!ui.build(vertices));
     CHECK(vertices.size() == oldSize);
@@ -214,8 +318,16 @@ int main() {
     scroll.setView(std::move(tall));
     std::vector<Vertex> clippedVertices;
     clipped.build(clippedVertices);
+    // vector shapes are clipped per fragment: every vertex carries a clip rect inside the screen
     for (const Vertex &v : clippedVertices)
-        CHECK(v.x >= 0 && v.x <= 300 && v.y >= 0 && v.y <= 200);
+        CHECK((v.clipMax & 0xFFFFu) <= 300 && (v.clipMax >> 16) <= 200);
+    // rectangles and text glyphs are clipped on the CPU: their vertices stay on screen
+    for (const Vertex &v : clippedVertices)
+        if (v.u != FontAtlas::whiteU())
+            CHECK(v.x >= 0 && v.x <= 300 && v.y >= 0 && v.y <= 200);
+
+    vectorTests();
+    fontTests();
 
     if (failures)
         return 1;

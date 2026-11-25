@@ -1,0 +1,79 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 28,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-msvc",
+      "displayName": "Windows x64 (MSVC, Ninja)",
+      "description": "Visual Studio 2022 C++ tools + Vulkan SDK. Open a \"x64 Native Tools\" prompt, or let Visual Studio / CLion set up the MSVC environment.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-windows",
+      "architecture": {
+        "value": "x64",
+        "strategy": "external"
+      },
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_COMPILER": "cl",
+        "CMAKE_CXX_COMPILER": "cl"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Windows"
+      }
+    },
+    {
+      "name": "windows-msvc-debug",
+      "displayName": "Windows x64 (MSVC, Ninja, Debug)",
+      "inherits": "windows-msvc",
+      "binaryDir": "${sourceDir}/build-windows-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "windows-cross-mingw",
+      "displayName": "Windows x64 (cross from Linux, MinGW-w64)",
+      "description": "mingw-w64-gcc or llvm-mingw on PATH (or MINGW_PREFIX set). Vulkan headers, GLFW, glm and OpenAL Soft are fetched.",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-mingw",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/mingw-w64-x86_64.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      },
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-msvc",
+      "configurePreset": "windows-msvc",
+      "targets": [
+        "openTrainSim"
+      ]
+    },
+    {
+      "name": "windows-msvc-debug",
+      "configurePreset": "windows-msvc-debug",
+      "targets": [
+        "openTrainSim"
+      ]
+    },
+    {
+      "name": "windows-cross-mingw",
+      "configurePreset": "windows-cross-mingw",
+      "targets": [
+        "openTrainSim"
+      ]
+    }
+  ]
+}

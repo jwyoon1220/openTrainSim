@@ -2,6 +2,7 @@
 // openBVE-compatible key bindings. Reads openBVE control files ("COMMAND, Keyboard, KEY,
 // MODIFIERS[, OPTION]") in both the OpenTK key naming (1.4.4+, "Period") and the legacy SDL
 // naming ("PERIOD"), so a player's own ~/.config/OpenBve/Settings/*/controls.cfg works as is.
+#include <optional>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -30,7 +31,9 @@ enum class Command : unsigned short {
     Count
 };
 
-const char* commandName(Command c);
+std::string_view commandName(Command c);
+// openBVE command name ("DOORS_LEFT", case-insensitive) → command; false if unknown.
+std::optional<Command> commandFromName(std::string_view name); // case-insensitive
 // openBVE VirtualKeys index of a SECURITY_* command, or -1.
 inline int securityKey(Command c) {
     const int i = int(c) - int(Command::SecurityS);

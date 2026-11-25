@@ -1,0 +1,6 @@
+// 선행 열차: 보안장치가 막힌 폐색 앞에서 개입하는지 시험합니다 (docs/traffic.md)
+{
+  "trains": [
+    { "name": "선행 전동차", "departure": "08:58:00", "train": "../trains/test-emu" }
+  ]
+}

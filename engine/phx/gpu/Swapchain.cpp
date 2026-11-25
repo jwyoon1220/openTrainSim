@@ -84,6 +84,7 @@ void Swapchain::create(Extent2D want, VkSwapchainKHR old) {
     if (ctx_.caps.lowLatency) ci.pNext = &latency;
     VK_CHECK(vkCreateSwapchainKHR(ctx_.device, &ci, nullptr, &handle));
     format = chosen.format;
+    presentMode = mode;
 
     vkGetSwapchainImagesKHR(ctx_.device, handle, &n, nullptr);
     images.resize(n);

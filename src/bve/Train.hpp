@@ -2,7 +2,9 @@
 // openBVE train definition: train.dat (performance, handles, cab), extensions.cfg (car
 // objects, lengths, axles, couplers) and the 3D cab (panel.animated).
 #include "bve/ObjectLibrary.hpp"
+#include "util/Expected.hpp"
 
+#include <optional>
 #include <array>
 #include <filesystem>
 #include <string>
@@ -22,7 +24,7 @@ enum class BrakeType : u8 { ElectromagneticStraight, ElectroPneumatic, Automatic
 
 // train.dat #MOTOR_P1/P2/B1/B2: one row per 0.2 km/h (openBVE BVEMotorSoundTableEntry).
 struct MotorSoundEntry {
-    int sound = -1;   // [Motor] index in sound.cfg, -1 = silent
+    std::optional<int> sound; // [Motor] index in sound.cfg, none = silent
     float pitch = 1.0f, gain = 1.0f;
 };
 
@@ -77,7 +79,7 @@ struct TrainDef {
     [[nodiscard]] double totalMass() const; // kg
 };
 
-bool loadTrain(const std::filesystem::path& folder, ObjectLibrary& lib, TrainDef& out, std::string& error);
+Expected<TrainDef> loadTrain(const std::filesystem::path& folder, ObjectLibrary& lib);
 // openBVE train folder lookup: Train/<name> next to the route's Railway folder.
 std::filesystem::path findTrainFolder(const std::filesystem::path& routeFile, const std::filesystem::path& trainHint,
                                       const std::string& name);

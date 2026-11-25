@@ -1,0 +1,62 @@
+OPENBVE18230
+; 시험용 4량 전동차 (2M2T, 110 km/h). 보안장치 시험용으로 만든 값입니다.
+#ACCELERATION
+0.6,0.6,30,60,1.5
+1.2,1.2,30,70,1.5
+1.8,1.8,35,80,1.5
+2.4,2.4,40,90,1.5
+3.0,3.0,45,100,1.5
+#PERFORMANCE
+3.5            ; Deceleration (km/h/s, service maximum)
+0.35           ; CoefficientOfStaticFriction
+0              ; Reserved
+0.0025         ; CoefficientOfRollingResistance
+1.1            ; AerodynamicDragCoefficient
+#DELAY
+0.3,0.3,0.3,0.3,0.3      ; DelayPowerUp
+0.3,0.3,0.3,0.3,0.3      ; DelayPowerDown
+0.5,0.5,0.5,0.5,0.5,0.5,0.5 ; DelayBrakeUp
+0.4,0.4,0.4,0.4,0.4,0.4,0.4 ; DelayBrakeDown
+#MOVE
+10             ; JerkPowerUp
+10             ; JerkPowerDown
+10             ; JerkBrakeUp
+10             ; JerkBrakeDown
+300            ; BrakeCylinderUp
+200            ; BrakeCylinderDown
+#BRAKE
+0              ; BrakeType (electromagnetic straight air)
+0              ; BrakeControlSystem
+0              ; BrakeControlSpeed
+#PRESSURE
+440            ; BrakeCylinderServiceMaximumPressure
+440            ; BrakeCylinderEmergencyMaximumPressure
+690            ; MainReservoirMinimumPressure
+780            ; MainReservoirMaximumPressure
+490            ; BrakePipeNormalPressure
+#HANDLE
+0              ; HandleType (separate)
+5              ; PowerNotches
+7              ; BrakeNotches
+0              ; PowerNotchReduceSteps
+#CAB
+-600           ; X (mm)
+2300           ; Y
+-1200          ; Z
+0              ; DriverCar
+#CAR
+40             ; MotorCarMass (t)
+2              ; NumberOfMotorCars
+33             ; TrailerCarMass
+2              ; NumberOfTrailerCars
+20             ; LengthOfACar
+0              ; FrontCarIsAMotorCar
+2.9            ; WidthOfACar
+3.6            ; HeightOfACar
+1.5            ; CenterOfGravityHeight
+5              ; ExposedFrontalArea
+1.6            ; UnexposedFrontalArea
+#DEVICE
+-1             ; Ats (openBVE built-in: none)
+0              ; Atc
+1              ; Eb

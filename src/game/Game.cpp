@@ -1,23 +1,33 @@
 #include "game/Game.hpp"
 
-#include "audio/Audio.hpp"
-#include "audio/TrainSounds.hpp"
+#include "audio/SoundManager.hpp"
 #include "bve/Route.hpp"
 #include "bve/Train.hpp"
+#include "cab/Cab.hpp"
 #include "phx/core/Log.hpp"
 #include "phx/platform/UiInput.hpp"
 #include "phx/platform/Window.hpp"
+#include "phx/ui/Font.hpp"
 #include "phx/ui/Ui.hpp"
 #include "render/Hud.hpp"
 #include "render/Renderer.hpp"
+#include "route/NativeRoute.hpp"
+#include "sim/Traffic.hpp"
+#include "terrain/Terrain.hpp"
 #include "sim/World.hpp"
+#include "util/Paths.hpp"
 #include "util/Text.hpp"
 #include "util/ThreadPool.hpp"
 
 #include <GLFW/glfw3.h>
 
 #include <array>
+#include <deque>
+#include <map>
 #include <cstdlib>
+#include <optional>
+#include <cstring>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <format>
@@ -27,7 +37,7 @@ namespace ots {
 namespace {
 
 enum class CamMode { Interior, Exterior, Track, Free };
-const char* camName(CamMode m) {
+std::string_view camName(CamMode m) {
     switch (m) {
     case CamMode::Interior: return "cab";
     case CamMode::Exterior: return "exterior";
@@ -76,6 +86,98 @@ double nearestTrackPosition(const Route& route, const glm::dvec3& p, double gues
     return std::clamp(best * route.blockLength + t, 0.0, route.endPosition() - 1.0);
 }
 
+// Ray through framebuffer pixel (x, y) in the driver car's coordinates.
+void cabRay(const CameraState& cam, const CarPose& car, double x, double y, Extent2D fb, glm::dvec3& o, glm::dvec3& d) {
+    const double aspect = double(fb.width) / double(std::max(1u, fb.height));
+    const double u = 2.0 * x / double(std::max(1u, fb.width)) - 1.0, v = 1.0 - 2.0 * y / double(std::max(1u, fb.height));
+    const double ty = std::tan(0.5 * double(cam.fovY));
+    const glm::dvec3 w = glm::normalize(cam.Z + cam.X * (u * ty * aspect) + cam.Y * (v * ty));
+    const glm::dvec3 rel = cam.position - car.position;
+    o = {glm::dot(rel, car.X), glm::dot(rel, car.Y), glm::dot(rel, car.Z)};
+    d = {glm::dot(w, car.X), glm::dot(w, car.Y), glm::dot(w, car.Z)};
+}
+
+// A content file given on the command line ("none" = off), else the one next to the route.
+std::filesystem::path contentFile(const std::filesystem::path& given, const std::filesystem::path& route,
+                                  std::filesystem::path (*besideRoute)(const std::filesystem::path&)) {
+    if (given == "none") return {};
+    return given.empty() ? besideRoute(route) : given;
+}
+
+// "1.5,-2,x" → {1.5, -2, nullopt}
+std::vector<std::optional<double>> numberList(std::string_view csv) {
+    std::vector<std::optional<double>> out;
+    for (std::string_view part : split(csv, ',')) out.push_back(parseDouble(part));
+    return out;
+}
+
+std::optional<double> envNumber(const char* name) {
+    const char* v = std::getenv(name);
+    return v ? parseDouble(v) : std::nullopt;
+}
+
+void addTerrain(Route& route, ObjectLibrary& lib, const std::filesystem::path& file) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto settings = loadTerrainSettings(file, route);
+    const auto built = settings ? buildTerrain(route, lib, *settings, file.parent_path()) : Expected<TerrainStats>(Unexpected(settings.error()));
+    if (!built) {
+        log::error("Terrain {}: {}", pathString(file), built.error());
+        return;
+    }
+    const TerrainStats& st = *built;
+    log::info("Terrain: {} tiles, {} generated tunnels ({:.1f} km), route tunnels {:.1f} km, {} bridges, DEM {} tiles ({} downloaded, {} missing), {:.1f} s",
+              st.tiles, st.tunnels, st.tunnelLength / 1000.0, st.routeTunnelLength / 1000.0, st.bridges, st.demTiles, st.demDownloaded, st.demMissing,
+              std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+}
+
+// <route>.traffic.json (if any) plus the route's Route.RunInterval trains.
+TrafficConfig loadTraffic(const std::filesystem::path& file, const Route& route) {
+    TrafficConfig tc;
+    if (!file.empty()) {
+        if (auto loaded = loadTrafficConfig(file)) {
+            tc = std::move(*loaded);
+            log::info("Traffic: {} ({} trains)", pathString(file), tc.trains.size());
+        } else {
+            log::error("Traffic {}: {}", pathString(file), loaded.error());
+        }
+    }
+    if (tc.routeIntervals)
+        for (std::size_t i = 0; i < route.runIntervals.size(); ++i) {
+            TrafficEntry e;
+            e.options.interval = route.runIntervals[i];
+            e.options.name = std::format("RunInterval {}", i + 1);
+            tc.trains.push_back(std::move(e));
+        }
+    return tc;
+}
+
+// Train types of the AI trains: the player's, or others loaded once per folder (stable
+// addresses: TrainSim keeps a reference).
+class TrafficFleet {
+public:
+    TrafficFleet(ObjectLibrary& lib, const TrainDef& player, std::filesystem::path playerFolder)
+        : lib_(lib), player_(player), playerFolder_(std::move(playerFolder)) {}
+    const TrainDef* get(const std::filesystem::path& folder, Renderer& renderer) {
+        if (folder.empty() || folder == playerFolder_) return &player_;
+        if (const auto it = byFolder_.find(folder); it != byFolder_.end()) return it->second;
+        auto loaded = loadTrain(folder, lib_);
+        if (!loaded) {
+            log::error("Traffic train {}: {}", pathString(folder), loaded.error());
+            return byFolder_[folder] = nullptr;
+        }
+        TrainDef& def = defs_.emplace_back(std::move(*loaded));
+        renderer.pinTrafficTrain(def);
+        return byFolder_[folder] = &def;
+    }
+
+private:
+    ObjectLibrary& lib_;
+    const TrainDef& player_;
+    std::filesystem::path playerFolder_;
+    std::deque<TrainDef> defs_;
+    std::map<std::filesystem::path, const TrainDef*> byFolder_;
+};
+
 } // namespace
 
 int runGame(const LaunchOptions& opt, Config& cfg) {
@@ -86,27 +188,32 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
     ObjectLibrary lib;
 
     // ---------------------------------------------------------------- route + train
-    Route route;
-    RouteLoadStats rs;
-    std::string err;
     log::info("Loading route {}", opt.route.string());
-    if (!loadRoute(opt.route, lib, route, rs, err)) {
-        log::error("{}", err);
+    auto loadedRoute = loadAnyRoute(opt.route, lib);
+    if (!loadedRoute) {
+        log::error("{}", loadedRoute.error());
         return 1;
     }
+    Route& route = loadedRoute->route; // stable: the simulation and renderer keep references
+    const RouteLoadStats& rs = loadedRoute->stats;
     log::info("Route: {:.1f} km, {} placements, {} objects, {} stations ({:.2f} s)", route.endPosition() / 1000.0, rs.placements, lib.size(),
                    route.stations.size(), rs.parseSeconds);
+    // ---------------------------------------------------------------- terrain (DEM)
+    if (cfg.getBool("terrain", "enabled", true))
+        if (const auto file = contentFile(opt.terrain, opt.route, findTerrainFile); !file.empty()) addTerrain(route, lib, file);
+
     std::filesystem::path trainFolder = opt.train;
     if (trainFolder.empty()) trainFolder = findTrainFolder(route.file, route.trainFolderHint, route.trainFolder);
     if (trainFolder.empty()) {
         log::error("Train folder '{}' not found (use --train <folder>)", route.trainFolder);
         return 1;
     }
-    TrainDef train;
-    if (!loadTrain(trainFolder, lib, train, err)) {
-        log::error("{}", err);
+    auto loadedTrain = loadTrain(trainFolder, lib);
+    if (!loadedTrain) {
+        log::error("{}", loadedTrain.error());
         return 1;
     }
+    const TrainDef& train = *loadedTrain; // stable: TrainSim keeps a reference
     for (const auto& w : train.warnings) log::warn("{}", w);
     log::info("Train {}: {} cars, {:.0f} m, {:.0f} t, cab: {}", train.name, train.cars.size(), train.length(), train.totalMass() / 1000.0,
                    train.cab != kNoObject ? "3D (panel.animated)" : (train.hasPanel2D ? "2D panel (not rendered yet)" : "none"));
@@ -130,12 +237,13 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
     const u32 width = u32(cfg.getInt("display", "width", 1600)), height = u32(cfg.getInt("display", "height", 900));
     Window window(width, height, "openTrainSim");
     window.setTitle(std::format("openTrainSim — {} / {}", opt.route.filename().string(), train.name));
+    if (opt.fullscreen || cfg.getBool("display", "fullscreen", false)) window.setFullscreen(true);
+    else if (opt.maximized || cfg.getBool("display", "maximized", false)) window.maximize();
     RenderSettings rset;
     {   // anti-aliasing / upscaling (older configs: [display] msaa = N)
         const int msaa = cfg.getInt("display", "msaa", 4);
         rset.aa = msaa >= 8 ? AaMode::Msaa8 : msaa >= 4 ? AaMode::Msaa4 : msaa >= 2 ? AaMode::Msaa2 : AaMode::Off;
-        AaMode m;
-        if (parseAaMode(cfg.get("render", "aa"), m)) rset.aa = m;
+        rset.aa = parseAaMode(cfg.get("render", "aa")).value_or(rset.aa);
         rset.frameGen = u32(std::clamp(cfg.getInt("render", "frameGeneration", 0), 0, 3));
     }
     rset.vsync = cfg.getBool("display", "vsync", true);
@@ -147,27 +255,81 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
     rset.geometry.vertexHeapMB = u32(cfg.getInt("render", "vertexHeapMB", 64));
     rset.geometry.indexHeapMB = u32(cfg.getInt("render", "indexHeapMB", 16));
     rset.geometry.keepSeconds = float(cfg.getNumber("render", "keepSeconds", 30.0));
+    rset.shadows = cfg.getBool("render", "shadows", true);
+    rset.shadowResolution = u32(std::clamp(cfg.getInt("render", "shadowResolution", 2048), 512, 4096));
+    rset.shadowDistance = float(std::clamp(cfg.getNumber("render", "shadowDistance", 250.0), 20.0, 2000.0));
+    rset.shadowStrength = float(std::clamp(cfg.getNumber("render", "shadowStrength", 1.0), 0.0, 1.0));
+    rset.cabSunlight = cfg.getBool("render", "cabSunlight", true);
+    rset.ssao = cfg.getBool("render", "ssao", true);
+    rset.ssaoRadius = float(std::clamp(cfg.getNumber("render", "ssaoRadius", 1.2), 0.1, 10.0));
+    rset.ssaoStrength = float(std::clamp(cfg.getNumber("render", "ssaoStrength", 1.0), 0.0, 4.0));
+    rset.hemisphere = float(std::clamp(cfg.getNumber("render", "hemisphereLight", 1.0), 0.0, 1.0));
+    rset.specular = float(std::clamp(cfg.getNumber("render", "specular", 0.15), 0.0, 2.0));
+    rset.bloom = float(std::clamp(cfg.getNumber("render", "bloom", 0.6), 0.0, 4.0));
+    rset.saturation = float(std::clamp(cfg.getNumber("render", "saturation", 1.1), 0.0, 2.0));
+    rset.contrast = float(std::clamp(cfg.getNumber("render", "contrast", 0.2), 0.0, 1.0));
+    rset.vignette = float(std::clamp(cfg.getNumber("render", "vignette", 0.12), 0.0, 1.0));
     Renderer renderer(window, rset, lib, pool);
     renderer.pinTrain(train);
 
+    TrafficFleet fleet(lib, train, trainFolder); // AI train types; outlives `sim` (TrainSim keeps a reference)
     Simulation sim(route, train);
+
+    // ---------------------------------------------------------------- AI traffic
+    if (cfg.getBool("simulation", "traffic", true)) {
+        for (const TrafficEntry& e : loadTraffic(contentFile(opt.traffic, opt.route, findTrafficFile), route).trains)
+            if (const TrainDef* def = fleet.get(e.trainFolder, renderer)) sim.addTraffic(*def, e.options); // else: logged, skipped
+    }
+    if (opt.startTime) route.startTime = opt.startTime; // before start(): AI trains are placed for this time
     sim.start(opt.station);
-    if (cfg.getBool("simulation", "plugins", true)) {
-        if (sim.startPlugin(pluginHostPath(), sim.pluginStatus)) log::info("Plugin: {}", sim.pluginStatus);
+    if (const auto at = envNumber("OTS_START_TRACK")) sim.train->placeAt(*at); // debugging: jump to a track position
+    // train protection: built-in Korean devices (<train>/safety.json) or the openBVE plugin
+    // ([simulation] safety = auto | builtin | plugin; auto: built-in when safety.json exists)
+    std::string safetyMode = cfg.get("simulation", "safety", "auto");
+    std::filesystem::path safetyFile = resolvePath(trainFolder, "safety.json");
+    if (opt.safety == "none") safetyMode = "plugin";
+    else if (!opt.safety.empty()) safetyMode = "builtin", safetyFile = opt.safety;
+    if (safetyMode == "builtin" || (safetyMode == "auto" && !safetyFile.empty())) {
+        auto config = safetyFile.empty() ? Expected<safety::SafetyConfig>(safety::defaultConfig()) : safety::loadConfig(safetyFile);
+        if (!config) {
+            log::error("{}: {}", safetyFile.string(), config.error());
+            config = safety::defaultConfig();
+        }
+        sim.onboard = std::make_unique<safety::Onboard>(*config);
+        std::string names;
+        for (safety::System s : config->systems) names += std::string(names.empty() ? "" : " + ") + std::string(safety::label(s));
+        sim.pluginStatus = "built-in " + names;
+        log::info("Train protection: built-in {}", names);
+    } else if (cfg.getBool("simulation", "plugins", true)) {
+        if (sim.startPlugin(pluginHostPath())) log::info("Plugin: {}", sim.pluginStatus);
         else log::warn("Plugin: {}", sim.pluginStatus);
     } else {
         sim.pluginStatus = "plugins disabled ([simulation] plugins = false)";
     }
 
-    // ---------------------------------------------------------------- sound
-    AudioSystem audio;
-    std::unique_ptr<TrainSounds> trainSounds;
-    if (cfg.getBool("sound", "enabled", true) && (opt.maxFrames == 0 || std::getenv("OTS_SOUND"))) {
-        if (audio.init(std::clamp(cfg.getInt("sound", "voices", 64), 8, 256))) {
-            audio.masterVolume = float(std::clamp(cfg.getNumber("sound", "volume", 1.0), 0.0, 4.0));
-            trainSounds = std::make_unique<TrainSounds>(audio, sim);
+    // ---------------------------------------------------------------- 3D cab (cab.json)
+    std::unique_ptr<Cab> cab;
+    {
+        std::filesystem::path cabFile = opt.cab;
+        if (cabFile.empty() && cfg.getBool("simulation", "cab3d", true)) cabFile = resolvePath(trainFolder, "cab.json");
+        if (!cabFile.empty() && cabFile != "none") {
+            if (auto loaded = Cab::load(cabFile, lib, sim)) {
+                cab = std::move(*loaded);
+                renderer.setCab(cab.get());
+                log::info("Cab: {} ({}, {} elements)", cab->name(), pathString(cabFile), cab->elementCount());
+            } else {
+                log::error("Cab {}: {} (using the openBVE cab)", pathString(cabFile), loaded.error());
+            }
         }
     }
+
+    // ---------------------------------------------------------------- sound
+    SoundManager sound;
+    sound.start({.enabled = cfg.getBool("sound", "enabled", true) && (opt.maxFrames == 0 || std::getenv("OTS_SOUND")),
+                 .voices = cfg.getInt("sound", "voices", 64),
+                 .volume = cfg.getNumber("sound", "volume", 1.0),
+                 .vvvf = !opt.vvvf.empty() ? opt.vvvf : std::filesystem::path(cfg.get("sound", "vvvf"))},
+                sim);
     sim.timeFactor = opt.timeFactor > 0 ? opt.timeFactor : cfg.getNumber("game", "timeFactor", 1.0);
 
     CameraControl cc;
@@ -177,9 +339,16 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
     // ---------------------------------------------------------------- UI
     ui::Theme theme;
     theme.textScale = float(cfg.getNumber("display", "uiScale", 2.0));
+    // TrueType UI font: the configured file first, then system faces (Latin + Korean) as fallbacks
+    if (const std::string font = cfg.get("display", "font", ""); !font.empty() && !ui::fonts().addFace(font))
+        log::warn("UI font not readable: {}", font);
+    ui::fonts().addSystemFaces();
+    if (!ui::fonts().available()) log::warn("No TrueType font found: using the built-in bitmap font (ASCII only)");
     ui::Ui gui(theme);
     HudOptions hudOpt;
     hudOpt.stats = cfg.getBool("game", "showStats", false);
+    hudOpt.profiler = cfg.getBool("game", "showProfiler", true);
+    hudOpt.frames = &renderer.profiler();
     hudOpt.help = cfg.getBool("game", "showHelp", true);
     ui::Window& settings = gui.addWindow("Settings");
     settings.setClosable(true);
@@ -190,15 +359,15 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
         auto& gfx = tabs.addTab("Graphics");
         gfx.setLayout(std::make_unique<ui::FormLayout>(12, 6));
         std::vector<std::string> aaNames;
-        for (int i = 0; i < int(AaMode::Count); ++i) aaNames.push_back(aaModeName(AaMode(i)));
+        for (int i = 0; i < static_cast<int>(AaMode::Count); ++i) aaNames.emplace_back(aaModeName(AaMode(i)));
         gfx.add<ui::Label>("Anti-aliasing");
         auto& aaBox = gfx.add<ui::ComboBox>(aaNames);
-        aaBox.setSelectedIndex(int(renderer.aaMode()));
-        for (int i = 0; i < int(AaMode::Count); ++i)
+        aaBox.setSelectedIndex(static_cast<int>(renderer.aaMode()));
+        for (int i = 0; i < static_cast<int>(AaMode::Count); ++i)
             if (isDlssMode(AaMode(i)) && !renderer.dlssAvailable()) aaBox.setItemEnabled(i, false);
         aaBox.addActionListener([&](int i) {
             renderer.setAaMode(AaMode(i));
-            cfg.set("render", "aa", aaModeKey(AaMode(i)));
+            cfg.set("render", "aa", std::string(aaModeKey(AaMode(i))));
         });
         gfx.add<ui::Label>("Frame generation");
         auto& fgBox = gfx.add<ui::ComboBox>(std::vector<std::string>{"Off", "DLSS-G 2x", "DLSS-G 3x", "DLSS-G 4x"});
@@ -222,6 +391,35 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
             renderer.setViewDistance(v);
             cfg.setNumber("render", "viewDistance", v);
         });
+        gfx.add<ui::Label>("Sun shadows");
+        auto& shBox = gfx.add<ui::CheckBox>("", rset.shadows);
+        shBox.addItemListener([&](bool b) {
+            renderer.setShadows(b);
+            cfg.set("render", "shadows", b ? "1" : "0");
+        });
+        gfx.add<ui::Label>("Ambient occlusion");
+        auto& aoBox = gfx.add<ui::CheckBox>("", rset.ssao);
+        aoBox.addItemListener([&](bool b) {
+            renderer.setSsao(b);
+            cfg.set("render", "ssao", b ? "1" : "0");
+        });
+        gfx.add<ui::Label>("Bloom");
+        auto& bl = gfx.add<ui::Slider>(0.0f, 2.0f, rset.bloom, 0.1f);
+        bl.setValueFormatter([](f32 v) { return v <= 0.0f ? std::string("off") : std::format("{:.1f}", v); });
+        bl.addChangeListener([&](f32 v) {
+            renderer.setBloom(v);
+            cfg.setNumber("render", "bloom", v);
+        });
+        gfx.add<ui::Label>("Colour grade");
+        auto& grade = gfx.add<ui::CheckBox>("", rset.contrast > 0.0f || rset.saturation != 1.0f || rset.vignette > 0.0f);
+        grade.addItemListener([&](bool b) {
+            const RenderSettings& r = rset;
+            renderer.setGrade(b ? (r.saturation != 1.0f ? r.saturation : 1.1f) : 1.0f, b ? (r.contrast > 0.0f ? r.contrast : 0.2f) : 0.0f,
+                              b ? (r.vignette > 0.0f ? r.vignette : 0.12f) : 0.0f);
+            cfg.set("render", "saturation", b ? "1.1" : "1");
+            cfg.set("render", "contrast", b ? "0.2" : "0");
+            cfg.set("render", "vignette", b ? "0.12" : "0");
+        });
         gfx.add<ui::Label>("Field of view");
         auto& fov = gfx.add<ui::Slider>(30.0f, 100.0f, float(cc.fovDeg), 1.0f);
         fov.setValueFormatter([](f32 v) { return std::format("{:.0f} deg", v); });
@@ -241,8 +439,14 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
         auto& tf = simTab.add<ui::Slider>(1.0f, 10.0f, float(sim.timeFactor), 1.0f);
         tf.setValueFormatter([](f32 v) { return std::format("x{:.0f}", v); });
         tf.addChangeListener([&](f32 v) { sim.timeFactor = v; });
+        simTab.add<ui::Label>("Profiler");
+        auto& prof = simTab.add<ui::CheckBox>("Ctrl+X", hudOpt.profiler);
+        prof.addItemListener([&](bool b) {
+            hudOpt.profiler = b;
+            cfg.set("game", "showProfiler", b ? "1" : "0");
+        });
         simTab.add<ui::Label>("Statistics");
-        auto& stats = simTab.add<ui::CheckBox>("Ctrl+X", hudOpt.stats);
+        auto& stats = simTab.add<ui::CheckBox>("", hudOpt.stats);
         stats.addItemListener([&](bool b) {
             hudOpt.stats = b;
             cfg.set("game", "showStats", b ? "1" : "0");
@@ -286,11 +490,11 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
             window.pollEvents();
             renderer.prefetch(route, sim.train->front);
             const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-            if ((!renderer.streaming() && i > 3) || elapsed > 60.0) break;
+            // what is in view is enough: Ahead / Far / Idle keep streaming in the background
+            if ((!renderer.streaming(JobPriority::View) && i > 3) || elapsed > 60.0) break;
             CameraState cam;
-            glm::dvec3 X, Y, Z;
-            sim.train->driverPose(cam.position, X, Y, Z);
-            cam.X = X, cam.Y = Y, cam.Z = Z;
+            const auto view = sim.train->driverPose();
+            cam.position = view.position, cam.X = view.X, cam.Y = view.Y, cam.Z = view.Z;
             cam.trackPosition = sim.train->front;
             hud.clear();
             HudOptions lo;
@@ -300,8 +504,9 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
             buildHud(hud, sim, renderer.stats(), lo, f32(e.width), f32(e.height), theme);
             renderer.render(sim, cam, hud, 1.0 / 60.0);
         }
-        log::info("Initial streaming done in {:.2f} s",
-                       std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+        log::info("Initial streaming done in {:.2f} s ({} objects, {} textures left to the background)",
+                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(), renderer.stats().meshesPending,
+                  renderer.stats().texturesPending);
     }
 
     // ---------------------------------------------------------------- main loop
@@ -313,6 +518,14 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
     double messageTimer = 0.0;
     std::string lastMessage;
     std::vector<std::vector<int>> securityHeld(GLFW_KEY_LAST + 1); // per key: plugin VirtualKeys pressed
+    double cursorX = -1.0, cursorY = -1.0; // framebuffer pixels
+    CameraState lastCam;                   // last frame's camera (cab mouse rays)
+    bool haveCam = false;
+    struct { double u = 0, v = 0; long frame = -1; } cabClick;
+    if (!opt.cabClick.empty()) {
+        const auto v = numberList(opt.cabClick);
+        if (v.size() >= 2 && v[0] && v[1]) cabClick = {*v[0], *v[1], long(v.size() > 2 ? v[2].value_or(60.0) : 60.0)};
+    }
     auto heldCommand = [&](Command c) {
         for (const KeyBinding& b : controls.bindings()) {
             if (b.command != c || b.glfwKey < 0 || !window.keyDown(b.glfwKey)) continue;
@@ -328,27 +541,25 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
         cc.mode = CamMode::Exterior;
         // "exterior:<distance>,<yaw>,<pitch>" (debug / screenshots)
         if (auto c = opt.camera.find(':'); c != std::string::npos) {
-            auto v = split(opt.camera.substr(c + 1), ',');
-            double x;
-            if (v.size() > 0 && parseDouble(v[0], x)) cc.extDist = x;
-            if (v.size() > 1 && parseDouble(v[1], x)) cc.extYaw = x;
-            if (v.size() > 2 && parseDouble(v[2], x)) cc.extPitch = x;
+            const auto v = numberList(std::string_view(opt.camera).substr(c + 1));
+            for (std::size_t k = 0; k < v.size() && k < 3; ++k)
+                if (v[k]) (k == 0 ? cc.extDist : k == 1 ? cc.extYaw : cc.extPitch) = *v[k];
         }
     }
     else if (opt.camera == "track") cc.mode = CamMode::Track;
     else if (opt.camera.starts_with("cab:")) { // "cab:<yaw>,<pitch>" (debug / screenshots)
-        auto v = split(opt.camera.substr(4), ',');
-        double x;
-        if (v.size() > 0 && parseDouble(v[0], x)) cc.yaw = x;
-        if (v.size() > 1 && parseDouble(v[1], x)) cc.pitch = x;
+        const auto v = numberList(std::string_view(opt.camera).substr(4));
+        if (v.size() > 0 && v[0]) cc.yaw = *v[0];
+        if (v.size() > 1 && v[1]) cc.pitch = *v[1];
     }
     for (long frame = 0; !window.shouldClose() && (opt.maxFrames <= 0 || frame < opt.maxFrames); ++frame) {
         if (opt.maxFrames > 0 && frame == opt.maxFrames - 3 && !opt.screenshot.empty()) renderer.requestScreenshot(opt.screenshot.string());
         if (opt.maxFrames > 0 && frame == opt.maxFrames - 3 && !opt.pick.empty()) {
-            auto v = split(opt.pick, ',');
-            double u = 0, w = 0;
-            if (v.size() == 2 && parseDouble(v[0], u) && parseDouble(v[1], w)) renderer.pick(f32(u), f32(w));
+            if (const auto v = numberList(opt.pick); v.size() == 2 && v[0] && v[1]) renderer.pick(f32(*v[0]), f32(*v[1]));
         }
+        renderer.profiler().beginFrame();
+        renderer.pace(); // vsync: idle here, before input, rather than in the swapchain after it
+        renderer.profiler().lap(CpuStage::Pace);
         window.pollEvents();
         const auto now = std::chrono::steady_clock::now();
         double dt = std::chrono::duration<double>(now - last).count();
@@ -376,11 +587,37 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
                 settings.centre(f32(fb.width), f32(fb.height));
             }
         }
-        bool uiMouse = false;
+        bool uiMouse = false, cabScrolled = false;
+        const bool cabMouse = cab && cc.mode == CamMode::Interior && haveCam && !window.cursorCaptured();
+        const CarPose& driverCarPose = sim.train->cars[std::size_t(train.spec.driverCar)];
+        if (cab && cabClick.frame == frame) { // scripted click (tests): press now, release next frame
+            glm::dvec3 o, d;
+            cabRay(lastCam, driverCarPose, (cabClick.u + 1.0) * 0.5 * fb.width, (1.0 - cabClick.v) * 0.5 * fb.height, fb, o, d);
+            const int el = cab->pick(o, d);
+            const bool hit = cab->press(0, o, d);
+            log::info("cab click {:.3f},{:.3f}: {} (ray {:.2f},{:.2f},{:.2f} → {:.2f},{:.2f},{:.2f})", cabClick.u, cabClick.v,
+                      el >= 0 ? cab->view(std::size_t(el)).name : "-", o.x, o.y, o.z, d.x, d.y, d.z);
+            if (!hit) cabClick.frame = -1;
+        } else if (cab && cabClick.frame >= 0 && cabClick.frame + 1 == frame) {
+            cab->release(0);
+        }
         for (const InputEvent& e : in.events) {
             if (gui.anyWindowVisible() && feedUi(gui, e)) {
                 uiMouse |= e.type != InputEvent::Type::Key;
                 if (e.type == InputEvent::Type::Key) continue;
+            }
+            if (e.type == InputEvent::Type::Move || e.type == InputEvent::Type::Button) cursorX = e.x, cursorY = e.y;
+            if (cabMouse && !uiMouse && !gui.wantsMouse()) {
+                glm::dvec3 o, d;
+                cabRay(lastCam, driverCarPose, cursorX, cursorY, fb, o, d);
+                if (e.type == InputEvent::Type::Button) {
+                    if (e.down) cab->press(e.code, o, d);
+                    else cab->release(e.code);
+                } else if (e.type == InputEvent::Type::Scroll && e.y != 0.0) {
+                    cabScrolled |= cab->scroll(o, d, e.y);
+                }
+            } else if (cab && e.type == InputEvent::Type::Button && !e.down) {
+                cab->release(e.code);
             }
             if (e.type != InputEvent::Type::Key || e.code < 0 || e.code > GLFW_KEY_LAST) continue;
             const bool wasHeld = held[std::size_t(e.code)];
@@ -408,8 +645,7 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
                     break;
                 case Command::CameraFlyby:
                     if (cc.mode != CamMode::Free) {
-                        glm::dvec3 p, X, Y, Z;
-                        sim.train->driverPose(p, X, Y, Z);
+                        const auto [p, X, Y, Z] = sim.train->driverPose();
                         cc.freePos = p + Y * 3.0 - Z * 10.0;
                         cc.freeYaw = std::atan2(Z.x, Z.z);
                         cc.freePitch = -0.1;
@@ -424,7 +660,12 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
                     break;
                 case Command::MiscPause: sim.paused = !sim.paused; break;
                 case Command::MiscQuit: window.requestClose(); break;
-                case Command::MiscFps: hudOpt.stats = !hudOpt.stats; break;
+                case Command::MiscFullscreen: window.setFullscreen(!window.fullscreen()); break;
+                case Command::MiscFps: // profiler → profiler + statistics → off → profiler
+                    if (!hudOpt.profiler) hudOpt.profiler = true, hudOpt.stats = false;
+                    else if (!hudOpt.stats) hudOpt.stats = true;
+                    else hudOpt.profiler = hudOpt.stats = false;
+                    break;
                 case Command::MiscBackface:
                     renderer.toggleBackfaceCulling();
                     hudOpt.message = renderer.backfaceCulling() ? "Backface culling on" : "Backface culling off";
@@ -452,11 +693,10 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
                     break;
                 case Command::HornMusic:
                     sim.hornBlow(3);
-                    if (trainSounds) trainSounds->hornMusic();
+                    sound.hornMusic();
                     break;
                 case Command::MiscMute:
-                    audio.muted = !audio.muted;
-                    hudOpt.message = audio.muted ? "Sound muted" : "Sound on";
+                    hudOpt.message = sound.toggleMute() ? "Sound muted" : "Sound on";
                     break;
                 default: sim.train->command(c); break;
                 }
@@ -464,6 +704,23 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
         }
         if (!heldCommand(Command::HornPrimary)) sim.train->hornPrimary = false;
         if (!heldCommand(Command::HornSecondary)) sim.train->hornSecondary = false;
+        if (cab) {
+            if (cabMouse && cursorX >= 0) {
+                glm::dvec3 o, d;
+                cabRay(lastCam, driverCarPose, cursorX, cursorY, fb, o, d);
+                cab->hover(o, d);
+            } else {
+                cab->hover(glm::dvec3(0.0), glm::dvec3(0.0, 0.0, 1e-9));
+            }
+            if (cab->capturing()) { // dragging a lever / switch: the mouse moves it, not the view
+                cab->drag(in.mouseDx, in.mouseDy);
+                in.mouseDx = in.mouseDy = 0.0;
+            }
+            if (cabScrolled) in.scroll = 0.0;
+            cab->update(sim.paused ? 0.0 : dt);
+            for (CabMessage& m : cab->messages) sim.messages.push_back({std::move(m.text), 0, m.seconds, sim.time + m.seconds});
+            cab->messages.clear();
+        }
 
         // camera (continuous)
         const double rot = 1.2 * dt, mov = 1.5 * dt;
@@ -504,28 +761,47 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
         if (opt.autopilot) {
             TrainSim& t = *sim.train;
             if (t.reverser != 1) t.command(Command::ReverserForward);
-            const StationProgress* sp = sim.nextStation >= 0 ? &sim.stations[std::size_t(sim.nextStation)] : nullptr;
-            if (sp && sp->arrived && !sp->departed) sim.time = std::max(sim.time, route.stations[std::size_t(sim.nextStation)].departure);
+            if (const auto next = sim.nextStation) {
+                const StationProgress& sp = sim.stations[*next];
+                if (sp.arrived && !sp.departed) sim.time = std::max(sim.time, route.stations[*next].departure.value_or(sim.time));
+            }
             // OTS_AUTOPILOT_OVER=<km/h>: deliberately run that much over the limit (safety-system tests)
-            static const double over = std::getenv("OTS_AUTOPILOT_OVER") ? std::atof(std::getenv("OTS_AUTOPILOT_OVER")) : -5.0;
-            const double target = std::min(sim.speedLimit(), 300.0 / 3.6) + over / 3.6;
+            static const double over = envNumber("OTS_AUTOPILOT_OVER").value_or(-5.0);
+            // the safety system knows limits we don't (ATP/TVM): when it overrides the handles,
+            // drive 15 km/h under the speed it intervened at, relaxing 5 km/h every 500 m
+            static double apCap = 1e9, apCapAt = 0.0;
+            if (t.safetyActive && t.safetyBrake > 0 && t.safetyBrake > t.brakeNotch) {
+                apCap = std::min(apCap, std::max(10.0 / 3.6, std::abs(t.speed) - 15.0 / 3.6));
+                apCapAt = t.front;
+            }
+            if (apCap < 1e9) {
+                const double relaxed = apCap + (t.front - apCapAt) / 500.0 * 5.0 / 3.6;
+                if (relaxed > 330.0 / 3.6) apCap = 1e9;
+                else apCap = relaxed, apCapAt = t.front;
+            }
+            const double target = std::min({sim.speedLimit(), 300.0 / 3.6, std::getenv("OTS_AUTOPILOT_OVER") ? 1e9 : apCap}) + over / 3.6;
             const bool fast = std::abs(t.speed) > target;
             t.emergency = false;
             t.brakeNotch = fast ? 3 : 0;
             t.powerNotch = fast ? 0 : t.maxPower();
         }
         // simulation
+        renderer.profiler().lap(CpuStage::Input);
         sim.update(dt);
+        renderer.profiler().lap(CpuStage::Simulation);
 
         // camera pose
         CameraState cam;
         cam.fovY = float(glm::radians(cc.fovDeg));
-        glm::dvec3 dp, X, Y, Z;
-        sim.train->driverPose(dp, X, Y, Z);
+        auto [dp, X, Y, Z] = sim.train->driverPose();
         switch (cc.mode) {
         case CamMode::Interior: {
             cc.offset += move * mov;
             cc.offset = glm::clamp(cc.offset, glm::dvec3(-1.5), glm::dvec3(1.5));
+            if (const auto eye = cab ? cab->eye() : std::nullopt) {
+                const CarPose& c = sim.train->cars[std::size_t(train.spec.driverCar)];
+                dp = c.position + X * eye->x + Y * eye->y + Z * eye->z;
+            }
             cam.position = dp + X * cc.offset.x + Y * cc.offset.y + Z * cc.offset.z;
             basisFrom(lookDir(X, Y, Z, cc.yaw, cc.pitch), Y, cam);
             cam.trackPosition = sim.train->front;
@@ -565,6 +841,7 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
             break;
         }
         }
+        lastCam = cam, haveCam = true;
         sim.cameraMode = cam.interior ? 0 : 1;
         sim.cameraPosition = cam.position;
 
@@ -577,8 +854,12 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
         hudOpt.cameraName = camName(cc.mode);
         const std::string pausedMsg = sim.paused ? "PAUSED" : "";
         HudOptions h = hudOpt;
-        if (audio.available()) h.audio = std::format("sound {} playing, {} audible{}", audio.activeSounds(), audio.audibleVoices(), audio.muted ? " (muted)" : "");
+        h.audio = sound.status();
         if (h.message.empty()) h.message = pausedMsg;
+        if (cab && cab->hovered() >= 0 && cabMouse) {
+            h.tooltip = cab->view(std::size_t(cab->hovered())).tooltip;
+            h.tooltipX = f32(cursorX), h.tooltipY = f32(cursorY);
+        }
         hud.clear();
         buildHud(hud, sim, renderer.stats(), h, f32(fb.width), f32(fb.height), theme);
         if (activeLabel && activeLabel->text() != renderer.activeDescription()) activeLabel->setText(renderer.activeDescription());
@@ -588,13 +869,15 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
             gui.build(uiVertices);
             hud.insert(hud.end(), uiVertices.begin(), uiVertices.end());
         }
-        if (trainSounds) {
-            trainSounds->update(sim, sim.paused ? 0.0 : dt * sim.timeFactor);
-            if (opt.maxFrames > 0 && (frame % 300) == 0)
-                log::info("sound @{:.0f} m {:.0f} km/h: {} playing, {} audible", sim.train->front, sim.train->speed * 3.6, audio.activeSounds(),
-                          audio.audibleVoices());
-            audio.update(dt, cam.position, cam.X, cam.Y, cam.Z, sim.train->cars, train.spec.driverCar, cam.interior);
+        renderer.profiler().lap(CpuStage::Hud);
+        if (cab) {
+            for (const CabSoundRequest& r : cab->sounds) sound.playOnCar(r.file, train.spec.driverCar, r.position, r.pitch, r.volume);
+            cab->sounds.clear();
         }
+        sound.update(sim, dt, {cam.position, cam.X, cam.Y, cam.Z, cam.interior});
+        renderer.profiler().lap(CpuStage::Sound);
+        if (sound.available() && opt.maxFrames > 0 && (frame % 300) == 0)
+            log::info("{} @{:.0f} m {:.0f} km/h", sound.status(), sim.train->front, sim.train->speed * 3.6);
         renderer.render(sim, cam, hud, dt);
         if (opt.maxFrames > 0 && frame % 1500 == 0) {
             const RenderStats& s = renderer.stats();

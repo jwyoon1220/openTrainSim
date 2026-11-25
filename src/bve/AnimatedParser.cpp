@@ -10,10 +10,8 @@ namespace {
 
 glm::vec3 parseVec3(std::string_view v, glm::vec3 def) {
     auto p = split(v, ',');
-    for (std::size_t i = 0; i < 3 && i < p.size(); ++i) {
-        double d;
-        if (parseDoubleVb6(p[i], d)) def[int(i)] = float(d);
-    }
+    for (std::size_t i = 0; i < 3 && i < p.size(); ++i)
+        if (const auto d = parseDoubleVb6(p[i])) def[int(i)] = float(*d);
     return def;
 }
 
@@ -26,16 +24,12 @@ std::shared_ptr<Function> fn(std::string_view src, const std::filesystem::path& 
 
 } // namespace
 
-bool loadAnimated(const std::filesystem::path& path, AnimatedDef& out, ObjectLibrary& lib, std::string& error, int depth) {
-    if (depth > 8) {
-        error = "include depth exceeded";
-        return false;
-    }
-    std::string text;
-    if (!readTextFile(path, text)) {
-        error = "cannot read";
-        return false;
-    }
+Expected<AnimatedDef> loadAnimated(const std::filesystem::path& path, ObjectLibrary& lib, int depth) {
+    if (depth > 8) return Unexpected("include depth exceeded");
+    const auto file = readTextFile(path);
+    if (!file) return Unexpected("cannot read");
+    AnimatedDef out;
+    const std::string& text = *file;
     const std::filesystem::path dir = path.parent_path();
     enum class Sec { None, Include, Object, Other } sec = Sec::None;
     AnimatedPart part;
@@ -47,10 +41,8 @@ bool loadAnimated(const std::filesystem::path& path, AnimatedDef& out, ObjectLib
         for (const auto& inc : includes) {
             const ObjectKind k = ObjectLibrary::kindOf(inc);
             if (k == ObjectKind::Animated) {
-                AnimatedDef sub;
-                std::string e;
-                if (loadAnimated(inc, sub, lib, e, depth + 1)) {
-                    for (AnimatedPart& p : sub.parts) {
+                if (auto sub = loadAnimated(inc, lib, depth + 1)) {
+                    for (AnimatedPart& p : sub->parts) {
                         p.position += includePos;
                         out.parts.push_back(std::move(p));
                     }
@@ -150,18 +142,15 @@ bool loadAnimated(const std::filesystem::path& path, AnimatedDef& out, ObjectLib
                 else part.translateFn[axis] = f;
             } else if (rest == "damping" && rot) {
                 auto p = split(val, ',');
-                double a = 0, b = 0;
-                if (!p.empty()) parseDoubleVb6(p[0], a);
-                if (p.size() > 1) parseDoubleVb6(p[1], b);
+                const double a = p.empty() ? 0.0 : parseDoubleVb6(p[0]).value_or(0.0), b = p.size() > 1 ? parseDoubleVb6(p[1]).value_or(0.0) : 0.0;
                 part.rotateDamping[axis] = {float(a), float(b)};
             }
         } else if (key == "refreshrate") {
-            double r;
-            if (parseDoubleVb6(val, r)) part.refreshRate = float(r);
+            if (const auto r = parseDoubleVb6(val)) part.refreshRate = float(*r);
         }
     }
     closeSection();
-    return true;
+    return out;
 }
 
 } // namespace ots

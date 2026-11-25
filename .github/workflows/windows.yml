@@ -1,0 +1,41 @@
+# Windows x64 build (MSVC + Ninja). Train plugins are skipped here (no OpenBveApi.dll on the
+# runner); everything else, including DLSS, is built.
+name: Windows build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Vulkan SDK (glslc)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe -OutFile vulkan-sdk.exe
+          Start-Process -Wait -FilePath .\vulkan-sdk.exe -ArgumentList '--root', 'C:\VulkanSDK', '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+          "VULKAN_SDK=C:\VulkanSDK" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "C:\VulkanSDK\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure
+        run: cmake --preset windows-msvc
+
+      - name: Build
+        run: cmake --build --preset windows-msvc --target openTrainSim ots_check
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openTrainSim-windows-x64
+          path: |
+            build-windows/openTrainSim.exe
+            build-windows/ots_check.exe
+            build-windows/*.dll
+            build-windows/shaders/

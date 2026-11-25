@@ -32,8 +32,11 @@ public:
     TextureCache(phx::VulkanContext& ctx, phx::Bindless& bindless, phx::UploadQueue& upload, ThreadPool& pool, TextureSettings settings);
     ~TextureCache();
 
-    TextureId acquire(const std::string& path, bool colorKey, u8 r, u8 g, u8 b);
+    // Decodes on a worker at `priority`; an existing texture still decoding is raised to it.
+    TextureId acquire(const std::string& path, bool colorKey, u8 r, u8 g, u8 b, JobPriority priority = JobPriority::View);
     void release(TextureId id);
+    // Raises a texture still decoding (or waiting for upload) to `priority`.
+    void prioritize(TextureId id, JobPriority priority);
     // Uploads finished decodes (within the upload budget), frees unreferenced textures.
     void update();
     [[nodiscard]] bool settled(TextureId id) const; // resident or failed
@@ -43,6 +46,8 @@ public:
     [[nodiscard]] std::size_t residentBytes() const { return residentBytes_; }
     [[nodiscard]] std::size_t residentCount() const { return residentCount_; }
     [[nodiscard]] std::size_t pendingCount() const { return pendingCount_; }
+    // Textures still decoding / waiting for upload at `upTo` or more urgent (a scan).
+    [[nodiscard]] std::size_t pendingCount(JobPriority upTo) const;
     [[nodiscard]] std::size_t uncompressedBytes() const { return rawBytes_; }
 
 private:
@@ -59,6 +64,8 @@ private:
         bool hasAlpha = false, translucent = false;
         std::size_t bytes = 0, raw = 0;
         u32 generation = 0;
+        JobPriority priority = JobPriority::Idle;
+        JobTicket job;
     };
     struct Done {
         TextureId id;
@@ -94,7 +101,8 @@ enum class AlphaMode : u8 { Opaque, AlphaTest, Blend, Additive };
 class MaterialTable {
 public:
     explicit MaterialTable(TextureCache& textures) : textures_(textures) {}
-    MaterialId acquire(const Material& m);
+    // Its texture is decoded at `priority` (raised if already queued lower).
+    MaterialId acquire(const Material& m, JobPriority priority = JobPriority::View);
     void release(MaterialId id);
     [[nodiscard]] bool ready(MaterialId id) const;
     [[nodiscard]] AlphaMode mode(MaterialId id) const;

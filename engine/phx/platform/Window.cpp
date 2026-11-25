@@ -91,4 +91,49 @@ Extent2D Window::framebufferSize() const {
     return {u32(w > 0 ? w : 0), u32(h > 0 ? h : 0)};
 }
 
+namespace {
+// The monitor containing the window centre (primary if none / unknown).
+GLFWmonitor* monitorOf(GLFWwindow* w) {
+    if (GLFWmonitor* m = glfwGetWindowMonitor(w)) return m; // fullscreen
+    if (glfwGetPlatform() == GLFW_PLATFORM_WAYLAND) return glfwGetPrimaryMonitor(); // windows have no global position there
+    int x = 0, y = 0, width = 0, height = 0;
+    glfwGetWindowPos(w, &x, &y);
+    glfwGetWindowSize(w, &width, &height);
+    int count = 0;
+    GLFWmonitor** monitors = glfwGetMonitors(&count);
+    GLFWmonitor* best = glfwGetPrimaryMonitor();
+    const int cx = x + width / 2, cy = y + height / 2;
+    for (int i = 0; i < count; ++i) {
+        int mx = 0, my = 0;
+        glfwGetMonitorPos(monitors[i], &mx, &my);
+        const GLFWvidmode* m = glfwGetVideoMode(monitors[i]);
+        if (m && cx >= mx && cx < mx + m->width && cy >= my && cy < my + m->height) best = monitors[i];
+    }
+    return best;
+}
+} // namespace
+
+int Window::refreshRate() const {
+    GLFWmonitor* m = monitorOf(window_);
+    const GLFWvidmode* mode = m ? glfwGetVideoMode(m) : nullptr;
+    return mode ? mode->refreshRate : 0;
+}
+
+void Window::setFullscreen(bool on) {
+    if (on == fullscreen_) return;
+    if (on) {
+        glfwGetWindowPos(window_, &savedX_, &savedY_);
+        glfwGetWindowSize(window_, &savedW_, &savedH_);
+        GLFWmonitor* best = monitorOf(window_);
+        const GLFWvidmode* mode = best ? glfwGetVideoMode(best) : nullptr;
+        if (!best || !mode) return;
+        glfwSetWindowMonitor(window_, best, 0, 0, mode->width, mode->height, mode->refreshRate);
+    } else {
+        glfwSetWindowMonitor(window_, nullptr, savedX_, savedY_, savedW_ > 0 ? savedW_ : 1600, savedH_ > 0 ? savedH_ : 900, 0);
+    }
+    fullscreen_ = on;
+}
+
+void Window::maximize() { glfwMaximizeWindow(window_); }
+
 } // namespace phx

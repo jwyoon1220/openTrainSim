@@ -1,0 +1,30 @@
+// Example VVVF preset (docs/vvvf.md): a GTO-era pattern. Low asynchronous carrier at start,
+// then synchronous modes stepping down 27 → 15 → 9 → 5 → 3 pulses, and one-pulse at speed.
+// Use: put it in the train folder as vvvf.json, or  openTrainSim <route> --vvvf examples/vvvf/gto-sync.json
+// Listen without the game:  ots_check --vvvf examples/vvvf/gto-sync.json gto.wav 100
+{
+  "name": "GTO synchronous steps",
+  "motor": { "poles": 4, "gear_ratio": 6.0, "wheel_diameter": 0.86, "slip_hz": 2.0 },
+  "base_hz": 55,
+
+  "power": [
+    { "until_kmh": 8,  "async": 400 },
+    { "until_kmh": 18, "sync": 27 },
+    { "until_kmh": 25, "sync": 15 },
+    { "until_kmh": 31, "sync": 9 },
+    { "until_kmh": 37, "sync": 5 },
+    { "until_kmh": 42, "sync": 3 },
+    { "pulse": 1 }
+  ],
+  // regenerative braking: same steps, a little later; off below 6 km/h
+  "brake": [
+    { "until_kmh": 10, "async": 400 },
+    { "until_kmh": 20, "sync": 27 },
+    { "until_kmh": 27, "sync": 15 },
+    { "until_kmh": 33, "sync": 9 },
+    { "until_kmh": 39, "sync": 5 },
+    { "until_kmh": 44, "sync": 3 },
+    { "pulse": 1 }
+  ],
+  "brake_cutoff_kmh": 6
+}

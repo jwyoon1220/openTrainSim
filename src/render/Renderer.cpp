@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -17,7 +18,7 @@ namespace ots {
 namespace {
 
 constexpr f32 kNear = 0.05f;
-constexpr VkDeviceSize kFrameHeader = 512;
+constexpr VkDeviceSize kFrameHeader = 1024;
 static_assert(sizeof(GpuFrame) <= kFrameHeader);
 
 glm::mat3 axisRot(const glm::vec3& axis, double angle) { return axisRotation(axis, float(angle)); }
@@ -53,7 +54,11 @@ GpuInstance makeInstance(const glm::dmat3& r, const glm::dvec3& t, glm::vec2 shi
     g.row0 = glm::vec4(float(r[0][0]), float(r[1][0]), float(r[2][0]), float(t.x));
     g.row1 = glm::vec4(float(r[0][1]), float(r[1][1]), float(r[2][1]), float(t.y));
     g.row2 = glm::vec4(float(r[0][2]), float(r[1][2]), float(r[2][2]), float(t.z));
-    g.params = glm::vec4(shift, brightness, 0.0f);
+    // openBVE texture shift scrolls a repeating texture: keep the offset in [0, 1) (precision)
+    // and have the shader repeat even when the material samples clamped (UVs inside 0..1, as
+    // digit strips are: "Number.csv" shifted by 0.1 per digit)
+    const glm::vec2 wrapped = shift - glm::floor(shift);
+    g.params = glm::vec4(wrapped, brightness, shift != glm::vec2(0.0f) ? 1.0f : 0.0f);
     g.prev = glm::vec4(0.0f);
     return g;
 }
@@ -107,10 +112,9 @@ AaInfo aaInfo(AaMode m) {
 
 struct AaName {
     AaMode mode;
-    const char* name;
-    const char* key;
+    std::string_view name, key;
 };
-constexpr AaName kAaNames[] = {
+constexpr auto kAaNames = std::to_array<AaName>({
     {AaMode::Off, "Off", "off"},
     {AaMode::Msaa2, "MSAA 2x", "msaa2"},
     {AaMode::Msaa4, "MSAA 4x", "msaa4"},
@@ -127,24 +131,21 @@ constexpr AaName kAaNames[] = {
     {AaMode::DlssBalanced, "DLSS Balanced", "dlss-balanced"},
     {AaMode::DlssPerformance, "DLSS Performance", "dlss-performance"},
     {AaMode::DlssUltra, "DLSS Ultra Perf.", "dlss-ultra"},
-};
+});
 
 } // namespace
 
-const char* aaModeName(AaMode m) {
-    for (const AaName& n : kAaNames)
-        if (n.mode == m) return n.name;
-    return "?";
+std::string_view aaModeName(AaMode m) {
+    const auto it = std::ranges::find(kAaNames, m, &AaName::mode);
+    return it != kAaNames.end() ? it->name : "?";
 }
-const char* aaModeKey(AaMode m) {
-    for (const AaName& n : kAaNames)
-        if (n.mode == m) return n.key;
-    return "off";
+std::string_view aaModeKey(AaMode m) {
+    const auto it = std::ranges::find(kAaNames, m, &AaName::mode);
+    return it != kAaNames.end() ? it->key : "off";
 }
-bool parseAaMode(std::string_view s, AaMode& out) {
-    for (const AaName& n : kAaNames)
-        if (s == n.key) return out = n.mode, true;
-    return false;
+std::optional<AaMode> parseAaMode(std::string_view s) {
+    const auto it = std::ranges::find(kAaNames, s, &AaName::key);
+    return it != kAaNames.end() ? std::optional(it->mode) : std::nullopt;
 }
 
 Renderer::Renderer(phx::Window& window, const RenderSettings& s, ObjectLibrary& lib, ThreadPool& pool)
@@ -158,8 +159,11 @@ Renderer::Renderer(phx::Window& window, const RenderSettings& s, ObjectLibrary& 
     textures_ = std::make_unique<TextureCache>(*ctx_, *bindless_, *upload_, pool, s.textures);
     materials_ = std::make_unique<MaterialTable>(*textures_);
     meshes_ = std::make_unique<MeshCache>(*ctx_, *upload_, pool, lib, *materials_, s.geometry);
-    ui_ = std::make_unique<phx::UiRenderer>(*ctx_, *bindless_, kFinalFormat, kFrames, 32768);
+    ui_ = std::make_unique<phx::UiRenderer>(*ctx_, *bindless_, kFinalFormat, kFrames);
     aa_ = std::make_unique<phx::AntiAliasing>(*ctx_, *bindless_);
+    ssao_ = std::make_unique<phx::Ssao>(*ctx_, *bindless_);
+    bloom_ = std::make_unique<phx::Bloom>(*ctx_, *bindless_);
+    gpuProfiler_ = std::make_unique<phx::GpuProfiler>(*ctx_, kFrames);
 
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(ctx_->physicalDevice, &props);
@@ -189,6 +193,7 @@ Renderer::~Renderer() {
     vkDeviceWaitIdle(ctx_->device);
     finishScreenshots();
     phx::destroyBuffer(*ctx_, screenshotBuffer_);
+    pool_.cancelQueued(); // quitting: queued prefetch is not worth waiting for
     pool_.waitIdle();
     for (FrameData& f : frames_) {
         phx::destroyBuffer(*ctx_, f.data);
@@ -199,6 +204,8 @@ Renderer::~Renderer() {
     destroyPipelines();
     destroyTargets();
     aa_.reset();
+    ssao_.reset();
+    bloom_.reset();
     upscaler_.reset();
     ui_.reset();
     meshes_.reset();
@@ -240,11 +247,15 @@ void Renderer::finishScreenshots() {
 void Renderer::destroyTargets() {
     for (phx::Image* img : {&sceneColor_, &sceneResolve_, &depth_, &motionImg_, &output_, &final_, &hudless_, &uiImage_, &fgOut_})
         phx::destroyImage(*ctx_, *img);
+    phx::destroyImage(*ctx_, shadowAtlas_);
+    phx::destroyImage(*ctx_, depthResolve_);
+    shadowAtlasSize_ = 0;
+    if (ssao_) ssao_->destroyTargets();
     if (aa_) aa_->destroyTargets();
 }
 
 void Renderer::destroyPipelines() {
-    for (VkPipeline* p : {&opaque_[0], &opaque_[1], &blend_[0], &blend_[1], &additive_, &background_, &tonemap_}) {
+    for (VkPipeline* p : {&opaque_[0], &opaque_[1], &blend_[0], &blend_[1], &additive_, &background_, &tonemap_, &shadowPipe_}) {
         if (*p) vkDestroyPipeline(ctx_->device, *p, nullptr);
         *p = VK_NULL_HANDLE;
     }
@@ -290,10 +301,13 @@ void Renderer::configure() {
                                     : phx::AntiAliasing::mipBias(upMode_, renderExt_, displayExt_);
 
     const VkImageUsageFlags sampled = VK_IMAGE_USAGE_SAMPLED_BIT;
+    const VkImageUsageFlags sceneUse = sampled | VK_IMAGE_USAGE_STORAGE_BIT; // SSAO is applied in place
     const bool msaa = samples_ != VK_SAMPLE_COUNT_1_BIT;
     sceneColor_ = createTarget(*ctx_, renderExt_, kHdrFormat, samples_,
-                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (msaa ? VkImageUsageFlags(VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) : sampled), false);
-    if (msaa) sceneResolve_ = createTarget(*ctx_, renderExt_, kHdrFormat, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | sampled, false);
+                               VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | (msaa ? VkImageUsageFlags(VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) : sceneUse), false);
+    if (msaa) sceneResolve_ = createTarget(*ctx_, renderExt_, kHdrFormat, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | sceneUse, false);
+    if (msaa && settings_.ssao)
+        depthResolve_ = createTarget(*ctx_, renderExt_, depthFormat_, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | sampled, true);
     depth_ = createTarget(*ctx_, renderExt_, depthFormat_, samples_,
                           VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | (msaa ? VkImageUsageFlags(VK_IMAGE_USAGE_TRANSIENT_ATTACHMENT_BIT) : sampled), true);
     if (motion_) motionImg_ = createTarget(*ctx_, renderExt_, kMotionFormat, VK_SAMPLE_COUNT_1_BIT, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | sampled, false);
@@ -313,7 +327,11 @@ void Renderer::configure() {
     if (motion_) {
         bindless_->setSampled(phx::kTexDepth, depth_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         bindless_->setSampled(phx::kTexMotion, motionImg_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    } else if (depthResolve_.image) {
+        bindless_->setSampled(phx::kTexDepth, depthResolve_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
+    if (settings_.ssao) ssao_->resize(renderExt_, scene);
+    bloom_->resize(displayExt_);
     if (resolves_) bindless_->setSampled(phx::kTexHdr, output_.view, VK_IMAGE_LAYOUT_GENERAL);
     else bindless_->setSampled(phx::kTexHdr, scene.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     if (!phx::isDlss(upMode_))
@@ -373,6 +391,30 @@ void Renderer::createPipelines() {
     t.fragment = "tonemap.frag";
     t.colorFormat = kFinalFormat;
     tonemap_ = phx::createGraphicsPipeline(*ctx_, *bindless_, t);
+    phx::GraphicsPipelineDesc sh;
+    sh.vertex = "mesh_shadow.vert";
+    sh.fragment = "mesh_shadow.frag";
+    sh.depthFormat = VK_FORMAT_D32_SFLOAT;
+    sh.depthTest = true;
+    sh.depthWrite = true;
+    sh.depthCompare = VK_COMPARE_OP_LESS_OR_EQUAL;
+    sh.cullMode = VK_CULL_MODE_NONE; // openBVE models are often open shells
+    sh.depthBiasConstant = 1.0f;
+    sh.depthBiasSlope = 2.0f;
+    shadowPipe_ = phx::createGraphicsPipeline(*ctx_, *bindless_, sh);
+}
+
+void Renderer::ensureShadowAtlas() {
+    const u32 size = 2 * std::clamp(settings_.shadowResolution, 512u, 4096u);
+    if (shadowAtlasSize_ == size) return;
+    vkDeviceWaitIdle(ctx_->device);
+    phx::destroyImage(*ctx_, shadowAtlas_);
+    shadowAtlas_ = createTarget(*ctx_, {size, size}, VK_FORMAT_D32_SFLOAT, VK_SAMPLE_COUNT_1_BIT,
+                                VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT, true);
+    if (!shadowSlot_) shadowSlot_ = bindless_->allocateSampled();
+    bindless_->setSampled(shadowSlot_, shadowAtlas_.view, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    shadowAtlasSize_ = size;
+    shadowFresh_ = true;
 }
 
 void Renderer::ensureFrameCapacity(FrameData& f, std::size_t materials, std::size_t instances) {
@@ -391,19 +433,46 @@ void Renderer::pinTrain(const TrainDef& train) {
     carAnim_.assign(train.cars.size(), {});
 }
 
+void Renderer::pinTrafficTrain(const TrainDef& train) {
+    for (const CarDef& c : train.cars)
+        if (c.exterior != kNoObject) meshes_->pin(c.exterior), pinned_.push_back(c.exterior);
+}
+
+void Renderer::setCab(const Cab* cab) {
+    cab_ = cab;
+    if (!cab) return;
+    for (ObjectId id : cab->bodies()) meshes_->pin(id), pinned_.push_back(id);
+    for (std::size_t i = 0; i < cab->elementCount(); ++i) // every state of every element
+        for (ObjectId id : cab->elementStates(i))
+            if (id != kNoObject) meshes_->pin(id), pinned_.push_back(id);
+    cabBodyAnim_.assign(cab->bodies().size(), {});
+    cabElementAnim_.assign(cab->elementCount(), {});
+}
+
 void Renderer::prefetch(const Route& route, double tp) {
     if (route.blocks.empty()) return;
     const double d = settings_.viewDistance;
     const int b0 = route.blockAt(tp - d - 50.0), b1 = route.blockAt(tp + d + 300.0);
     for (int b = b0; b <= b1; ++b) {
         const RouteBlock& blk = route.blocks[std::size_t(b)];
-        for (u32 i = 0; i < blk.placementCount; ++i) meshes_->request(route.placements[blk.firstPlacement + i].object, true);
+        const double along = std::abs((b + 0.5) * route.blockLength - tp);
+        const JobPriority priority = along < 300.0 ? JobPriority::Near : along < d ? JobPriority::View : JobPriority::Ahead;
+        for (u32 i = 0; i < blk.placementCount; ++i) meshes_->request(route.placements[blk.firstPlacement + i].object, priority);
     }
     // Only requests: uploads must be queued between UploadQueue::beginFrame() and record() of
     // the same frame (render() does that), or beginFrame() would discard them.
 }
 
-bool Renderer::streaming() const { return meshes_->pendingCount() > 0 || textures_->pendingCount() > 0; }
+JobPriority Renderer::streamPriority(const glm::dvec3& pos) const {
+    const double dist = glm::length(pos - camPos_);
+    const JobPriority p = dist < 300.0 ? JobPriority::Near : dist < settings_.viewDistance ? JobPriority::View : JobPriority::Ahead;
+    return visible(pos, 30.0f) ? p : lessUrgent(p);
+}
+
+bool Renderer::streaming(JobPriority upTo) const {
+    if (upTo == JobPriority::Idle) return meshes_->pendingCount() > 0 || textures_->pendingCount() > 0;
+    return meshes_->pendingCount(upTo) > 0 || textures_->pendingCount(upTo) > 0;
+}
 
 bool Renderer::visible(const glm::dvec3& center, f32 radius) const {
     const glm::vec3 c(center - camPos_);
@@ -414,19 +483,33 @@ bool Renderer::visible(const glm::dvec3& center, f32 radius) const {
     return true;
 }
 
+bool Renderer::casterVisible(const glm::dvec3& center, f32 radius) const {
+    const glm::vec3 c(center - camPos_);
+    const f32 r = std::max(radius, 0.5f);
+    for (u32 k = 0; k < cascadeCount_; ++k) {
+        const phx::ShadowCascade& sc = cascades_[k];
+        const f32 z = glm::dot(c - sc.center, sc.lightZ);
+        if (z - r <= sc.radius && sc.covers(c, r)) return true; // nothing beyond the slice can shade it
+    }
+    return false;
+}
+
 void Renderer::emitStatic(ObjectId id, const glm::dmat3& rot, const glm::dvec3& pos, f32 brightness, glm::vec2 shift) {
-    const GpuMesh* mesh = meshes_->drawable(id, frameNumber_);
+    const GpuMesh* mesh = meshes_->drawable(id, frameNumber_, streamPriority(pos));
     if (!mesh || mesh->draws.empty()) return;
-    if (!visible(pos, mesh->radius)) return;
+    u8 flags = 0;
+    if ((emitMask_ & kItemView) && visible(pos, mesh->radius)) flags |= kItemView;
+    if ((emitMask_ & kItemCaster) && cascadeCount_ && casterVisible(pos, mesh->radius + glm::length(mesh->center))) flags |= kItemCaster;
+    if (!flags) return;
     const glm::dvec3 rel = pos - camPos_;
     GpuInstance inst = makeInstance(rot, rel, shift, brightness);
     // previous camera-relative position − current: camera motion plus the object's own motion
     inst.prev = glm::vec4(glm::vec3(havePrev_ ? (camPos_ - prevCamPos_) + objectMotion_ : glm::dvec3(0.0)), 0.0f);
-    items_.push_back({id, mesh, inst, float(glm::length(rel + rot * glm::dvec3(mesh->center)))});
+    items_.push_back({id, mesh, inst, float(glm::length(rel + rot * glm::dvec3(mesh->center))), 0, flags});
 }
 
 void Renderer::emitAnimated(ObjectId id, const glm::dmat3& rot, const glm::dvec3& pos, AnimState& st, ScriptContext& ctx, double dt, f32 brightness) {
-    const AnimatedDef* def = meshes_->animated(id, frameNumber_);
+    const AnimatedDef* def = meshes_->animated(id, frameNumber_, streamPriority(pos));
     if (!def) return;
     st.lastFrame = frameNumber_;
     if (st.parts.size() != def->parts.size()) st.parts.assign(def->parts.size(), {});
@@ -513,7 +596,7 @@ void Renderer::gatherRoute(const Simulation& sim, const CameraState& cam, Script
             const u32 pi = blk.firstPlacement + i;
             const Placement& p = route.placements[pi];
             if (far) {
-                meshes_->request(p.object);
+                meshes_->request(p.object, JobPriority::Far);
                 continue;
             }
             const ObjectRecord& rec = lib_[p.object];
@@ -541,7 +624,7 @@ void Renderer::gatherTrain(const Simulation& sim, const CameraState& cam, Script
     const TrainDef& def = t.def();
     if (carAnim_.size() != def.cars.size()) carAnim_.assign(def.cars.size(), {});
     ctx.trainObject = true;
-    ctx.section = -1;
+    ctx.section.reset();
     const int driver = def.spec.driverCar;
     if (prevCarPos_.size() != def.cars.size()) prevCarPos_.clear();
     for (std::size_t i = 0; i < def.cars.size(); ++i) {
@@ -551,12 +634,29 @@ void Renderer::gatherTrain(const Simulation& sim, const CameraState& cam, Script
         if (def.cars[i].reversed) rot = glm::dmat3(-c.X, c.Y, -c.Z);
         ctx.car = int(i);
         ctx.trackPosition = 0.5 * (c.frontAxle + c.rearAxle);
-        const bool hide = cam.interior && int(i) == driver && def.cab != kNoObject;
-        if (!hide && def.cars[i].exterior != kNoObject) {
+        const bool hide = cam.interior && int(i) == driver; // the eye is inside it (cab or not)
+        if ((!hide || settings_.cabSunlight) && def.cars[i].exterior != kNoObject) {
+            // hidden in the cab view, the body still shades the cab (light through the windows)
+            emitMask_ = hide ? kItemCaster : u8(kItemView | kItemCaster);
             if (lib_[def.cars[i].exterior].kind == ObjectKind::Animated) emitAnimated(def.cars[i].exterior, rot, c.position, carAnim_[i], ctx, dt, 1.0f);
             else emitStatic(def.cars[i].exterior, rot, c.position, 1.0f);
+            emitMask_ = kItemView | kItemCaster;
         }
-        if (cam.interior && int(i) == driver && def.cab != kNoObject) {
+        if (cam.interior && int(i) == driver && cab_) {
+            const glm::dmat3 crot(c.X, c.Y, c.Z);
+            const f32 b = sim.cabBrightness();
+            auto emit = [&](ObjectId id, const glm::dmat3& r, const glm::dvec3& p, AnimState& st, f32 br) {
+                if (id == kNoObject) return;
+                if (lib_[id].kind == ObjectKind::Animated) emitAnimated(id, r, p, st, ctx, dt, br);
+                else emitStatic(id, r, p, br);
+            };
+            for (std::size_t k = 0; k < cab_->bodies().size(); ++k) emit(cab_->bodies()[k], crot, c.position, cabBodyAnim_[k], b);
+            for (std::size_t k = 0; k < cab_->elementCount(); ++k) {
+                const auto [er, et] = cab_->elementPose(k);
+                const f32 hb = int(k) == cab_->hovered() ? b * 1.6f + 0.15f : b; // highlight under the mouse
+                emit(cab_->elementObject(k), crot * er, c.position + crot * et, cabElementAnim_[k], hb);
+            }
+        } else if (cam.interior && int(i) == driver && def.cab != kNoObject) {
             const glm::dmat3 crot(c.X, c.Y, c.Z);
             const f32 b = sim.cabBrightness();
             if (lib_[def.cab].kind == ObjectKind::Animated) emitAnimated(def.cab, crot, c.position, cabAnim_, ctx, dt, b);
@@ -568,6 +668,66 @@ void Renderer::gatherTrain(const Simulation& sim, const CameraState& cam, Script
     for (std::size_t i = 0; i < def.cars.size(); ++i) prevCarPos_[i] = t.cars[i].position;
 }
 
+void Renderer::gatherTraffic(const Simulation& sim, ScriptContext& ctx, double dt) {
+    if (traffic_.size() != sim.traffic.size()) traffic_.resize(sim.traffic.size());
+    ctx.trainObject = true;
+    ctx.section.reset();
+    for (std::size_t k = 0; k < sim.traffic.size(); ++k) {
+        const TrafficTrain& tt = sim.traffic[k];
+        TrafficState& ts = traffic_[k];
+        if (!tt.active()) {
+            ts.prev.clear();
+            continue;
+        }
+        const TrainSim& t = tt.train();
+        const TrainDef& def = t.def();
+        if (ts.cars.size() != def.cars.size()) ts.cars.assign(def.cars.size(), {});
+        if (ts.prev.size() != def.cars.size()) ts.prev.clear();
+        ctx.train = &t;
+        for (std::size_t i = 0; i < def.cars.size(); ++i) {
+            const CarPose& c = t.cars[i];
+            if (def.cars[i].exterior == kNoObject) continue;
+            objectMotion_ = ts.prev.empty() ? glm::dvec3(0.0) : ts.prev[i] - c.position;
+            glm::dmat3 rot(c.X, c.Y, c.Z);
+            if (def.cars[i].reversed) rot = glm::dmat3(-c.X, c.Y, -c.Z);
+            ctx.car = int(i);
+            ctx.trackPosition = 0.5 * (c.frontAxle + c.rearAxle);
+            if (lib_[def.cars[i].exterior].kind == ObjectKind::Animated) emitAnimated(def.cars[i].exterior, rot, c.position, ts.cars[i], ctx, dt, 1.0f);
+            else emitStatic(def.cars[i].exterior, rot, c.position, 1.0f);
+        }
+        ts.prev.resize(def.cars.size());
+        for (std::size_t i = 0; i < def.cars.size(); ++i) ts.prev[i] = t.cars[i].position;
+    }
+    ctx.train = nullptr;
+    ctx.car = 0;
+    objectMotion_ = glm::dvec3(0.0);
+}
+
+// With vsync (FIFO) the frame rate is the display's; left alone, the frame is built from
+// input and simulation first and then blocks in vkAcquireNextImageKHR until a refresh frees
+// an image (~9 ms at 165 Hz with frame generation 2x). Instead, that time is slept at the start
+// of the frame: the same frames are built from input sampled that much later (lower latency)
+// and the swapchain queue stays short. The delay is steered so the acquire still waits about
+// kPaceMarginMs (so a slower frame does not miss its refresh).
+void Renderer::pace() {
+    if (!settings_.vsync || paceDelayMs_ <= 0.0) return;
+    using Clock = std::chrono::steady_clock;
+    const auto target = Clock::now() + std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double, std::milli>(paceDelayMs_));
+    // sleep most of it, spin the last bit (sleep overshoots by up to ~0.1-0.5 ms)
+    if (paceDelayMs_ > 0.7) std::this_thread::sleep_until(target - std::chrono::microseconds(500));
+    while (Clock::now() < target) std::this_thread::yield();
+}
+
+void Renderer::steerPace(double waitedMs) {
+    if (!settings_.vsync) {
+        paceDelayMs_ = 0.0;
+        return;
+    }
+    if (frameNumber_ % 120 == 1 || refreshHz_ <= 0) refreshHz_ = window_.refreshRate(); // the window may move to another monitor
+    const double periodMs = 1000.0 * double(fgCount_ + 1) / (refreshHz_ > 0 ? refreshHz_ : 60.0);
+    paceDelayMs_ = std::clamp(paceDelayMs_ + 0.5 * (waitedMs - kPaceMarginMs), 0.0, std::max(0.0, periodMs - 2.0));
+}
+
 void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<const phx::ui::Vertex> hud, double frameSeconds) {
     const auto t0 = std::chrono::steady_clock::now();
     const phx::Extent2D fb = window_.framebufferSize();
@@ -576,13 +736,15 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     if (configDirty_ || swapchainDirty_) configure();
 
     FrameData& f = frames_[slot_];
+    const auto waitStart = std::chrono::steady_clock::now();
     VK_CHECK(vkWaitForFences(ctx_->device, 1, &f.fence, VK_TRUE, UINT64_MAX));
+    gpuProfiler_->beginFrame(slot_); // this slot's previous frame is done: read its timestamps
     bindless_->retireFrame();
     upload_->beginFrame(slot_);
     ++frameNumber_;
 
     // swapchain images: one per generated frame, then the rendered frame
-    u32 images[4] = {};
+    std::array<u32, 4> images{};
     u32 acquiredCount = 0;
     for (u32 k = 0; k <= fgCount_; ++k) {
         const VkResult r = vkAcquireNextImageKHR(ctx_->device, swapchain_->handle, UINT64_MAX, f.acquired[k], VK_NULL_HANDLE, &images[k]);
@@ -595,10 +757,13 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     }
     const u32 generated = acquiredCount - 1; // images[0 .. generated-1] generated, images[generated] real
     VK_CHECK(vkResetFences(ctx_->device, 1, &f.fence));
+    steerPace(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count());
+    profiler_.lap(CpuStage::Wait);
 
     // streaming: textures first (they gate drawing), then geometry
     textures_->update();
     meshes_->update(frameNumber_, frameSeconds);
+    profiler_.lap(CpuStage::Streaming);
 
     // camera: unjittered projection, then the temporal jitter (render pixels)
     const VkExtent2D rext = renderExt_, dext = displayExt_;
@@ -620,7 +785,7 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     const glm::mat4 viewProj = proj * glm::mat4(view);
     const glm::mat4 viewProjJ = projJ * glm::mat4(view);
     {
-        glm::vec4 row[4];
+        std::array<glm::vec4, 4> row;
         for (int i = 0; i < 4; ++i) row[i] = glm::vec4(viewProj[0][i], viewProj[1][i], viewProj[2][i], viewProj[3][i]);
         planes_[0] = row[3] + row[0];
         planes_[1] = row[3] - row[0];
@@ -634,12 +799,32 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     const bool reset = resetHistory_ || !havePrev_ || jump;
     if (jump) havePrev_ = false; // no motion vectors across the jump
 
+    // sun shadow cascades (before gathering: they decide which objects cast)
+    cascadeCount_ = 0;
+    const glm::vec3 toLight = glm::length(sim.route.lightDirection) > 0.0f ? glm::normalize(sim.route.lightDirection) : glm::vec3(0, 1, 0);
+    if (settings_.shadows && toLight.y > 0.02f) {
+        ensureShadowAtlas();
+        phx::ShadowCascadeInput sci;
+        sci.camera = cam.position;
+        sci.forward = glm::vec3(cam.Z);
+        sci.fovY = cam.fovY;
+        sci.aspect = aspect;
+        sci.nearPlane = kNear;
+        sci.distance = std::min(settings_.shadowDistance, settings_.viewDistance);
+        sci.toLight = toLight;
+        sci.resolution = shadowAtlasSize_ / 2;
+        phx::computeShadowCascades(sci, cascades_);
+        cascadeCount_ = kCascades;
+    }
+
     // gather instances
     stats_.placementsVisible = stats_.animatedEvaluated = 0;
     items_.clear();
     ScriptContext ctx(sim);
     gatherRoute(sim, cam, ctx, frameSeconds);
     gatherTrain(sim, cam, ctx, frameSeconds);
+    gatherTraffic(sim, ctx, frameSeconds);
+    profiler_.lap(CpuStage::Gather);
 
     if (pickRequest_) {
         pickRequest_ = false;
@@ -675,19 +860,47 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
         f32 distance;
         AlphaMode mode;
     };
-    std::vector<Cmd> opaque, blended;
+    // Instances are written list by list: the main view, then each shadow cascade. Each
+    // (object, material) of a list is one instanced draw over a contiguous range.
+    std::vector<GpuInstance> instances;
+    instances.reserve(items_.size() * 2);
+    std::vector<Cmd> opaque, blended, shadowCmds[kCascades];
+    std::vector<u32> group;
     for (std::size_t i = 0; i < items_.size();) {
         std::size_t j = i;
         while (j < items_.size() && items_[j].order == items_[i].order) ++j;
-        for (const GpuDraw& d : items_[i].mesh->draws) {
-            const AlphaMode m = materials_->mode(d.material);
-            if (m == AlphaMode::Opaque || m == AlphaMode::AlphaTest) {
-                opaque.push_back({&d, u32(i), u32(j - i), 0.0f, m});
-            } else {
-                // translucent (not additive): opaque texels first, with depth (openBVE smooth mode)
-                if (m == AlphaMode::Blend) opaque.push_back({&d, u32(i), u32(j - i), 0.0f, m});
-                for (std::size_t k = i; k < j; ++k) blended.push_back({&d, u32(k), 1, items_[k].distance, m});
+        // main view
+        group.clear();
+        for (std::size_t k = i; k < j; ++k)
+            if (items_[k].flags & kItemView) group.push_back(u32(k));
+        if (!group.empty()) {
+            const u32 first = u32(instances.size());
+            for (u32 k : group) instances.push_back(items_[k].instance);
+            const u32 count = u32(group.size());
+            for (const GpuDraw& d : items_[i].mesh->draws) {
+                const AlphaMode m = materials_->mode(d.material);
+                if (m == AlphaMode::Opaque || m == AlphaMode::AlphaTest) {
+                    opaque.push_back({&d, first, count, 0.0f, m});
+                } else {
+                    // translucent (not additive): opaque texels first, with depth (openBVE smooth mode)
+                    if (m == AlphaMode::Blend) opaque.push_back({&d, first, count, 0.0f, m});
+                    for (u32 n = 0; n < count; ++n) blended.push_back({&d, first + n, 1, items_[group[n]].distance, m});
+                }
             }
+        }
+        // shadow cascades
+        for (u32 c = 0; c < cascadeCount_; ++c) {
+            const u32 first = u32(instances.size());
+            for (std::size_t k = i; k < j; ++k) {
+                const Item& it = items_[k];
+                if (!(it.flags & kItemCaster)) continue;
+                const glm::vec3 centre(it.instance.row0.w, it.instance.row1.w, it.instance.row2.w);
+                if (cascades_[c].covers(centre, it.mesh->radius + glm::length(it.mesh->center))) instances.push_back(it.instance);
+            }
+            const u32 count = u32(instances.size()) - first;
+            if (!count) continue;
+            for (const GpuDraw& d : items_[i].mesh->draws)
+                if (materials_->mode(d.material) != AlphaMode::Additive) shadowCmds[c].push_back({&d, first, count, 0.0f, AlphaMode::Opaque});
         }
         i = j;
     }
@@ -695,13 +908,13 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     std::stable_sort(blended.begin(), blended.end(), [](const Cmd& a, const Cmd& b) { return std::lround(a.distance * 1000.0f) > std::lround(b.distance * 1000.0f); });
 
     // per-frame data: header, materials, instances
-    ensureFrameCapacity(f, materials_->size() + 16, items_.size() + 16);
+    ensureFrameCapacity(f, materials_->size() + 16, instances.size() + 16);
     auto* base = static_cast<u8*>(f.data.mapped);
     const VkDeviceSize matOffset = kFrameHeader;
     const VkDeviceSize instOffset = (matOffset + f.materialCapacity * sizeof(GpuMaterial) + 63) / 64 * 64;
     materials_->write(reinterpret_cast<GpuMaterial*>(base + matOffset), u32(f.materialCapacity));
     auto* inst = reinterpret_cast<GpuInstance*>(base + instOffset);
-    for (std::size_t i = 0; i < items_.size(); ++i) inst[i] = items_[i].instance;
+    std::ranges::copy(instances, inst);
 
     GpuFrame fr{};
     fr.viewProj = viewProjJ;
@@ -715,23 +928,31 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     fr.fog = glm::vec4(fog.start, fog.end, fog.end > fog.start ? 1.0f : 0.0f, samples_ != VK_SAMPLE_COUNT_1_BIT ? 1.0f : 0.0f);
     fr.fogColor = glm::vec4(fogColor, 1.0f);
     {
-        const int bg = sim.route.backgroundAt(cam.trackPosition);
+        const auto bg = sim.route.backgroundAt(cam.trackPosition);
         std::string path;
-        if (bg >= 0 && std::size_t(bg) < sim.route.backgrounds.size()) path = sim.route.backgrounds[std::size_t(bg)].texture.string();
+        if (bg && *bg < sim.route.backgrounds.size()) path = sim.route.backgrounds[*bg].texture.string();
         if (path != backgroundPath_) {
             const TextureId old = backgroundTexture_;
-            backgroundTexture_ = path.empty() ? kNone : textures_->acquire(path, false, 0, 0, 0);
+            backgroundTexture_ = path.empty() ? kNone : textures_->acquire(path, false, 0, 0, 0, JobPriority::Near);
             textures_->release(old);
             backgroundPath_ = path;
         }
         const float radius = 1000.0f;
-        const int reps = bg >= 0 && std::size_t(bg) < sim.route.backgrounds.size() ? sim.route.backgrounds[std::size_t(bg)].repetitions : 6;
+        const int reps = bg && *bg < sim.route.backgrounds.size() ? sim.route.backgrounds[*bg].repetitions : 6;
         fr.background = glm::vec4(radius, -0.125f * radius, 0.375f * radius, float(reps));
         fr.misc = glm::vec4(float(textures_->slot(backgroundTexture_, false)), 1.0f, float(sim.time), mipBias_);
     }
+    for (u32 k = 0; k < cascadeCount_; ++k) {
+        fr.shadow[k] = cascades_[k].viewProj;
+        fr.shadowCascade[k] = glm::vec4(cascades_[k].texelWorld, cascades_[k].farSplit, 0.0f, 0.0f);
+    }
+    fr.lighting = glm::vec4(settings_.hemisphere, settings_.specular, 0.0f, 0.0f);
+    fr.post = glm::vec4(settings_.bloom, settings_.saturation, settings_.contrast, settings_.vignette);
+    fr.shadowParams = glm::vec4(float(cascadeCount_), float(shadowAtlasSize_), float(shadowSlot_), std::clamp(settings_.shadowStrength, 0.0f, 1.0f));
     std::memcpy(base, &fr, sizeof(fr));
     vmaFlushAllocation(ctx_->allocator, f.data.allocation, 0, VK_WHOLE_SIZE);
     ui_->upload(slot_, hud);
+    profiler_.lap(CpuStage::Build);
 
     // ---------------------------------------------------------------- record
     VkCommandBuffer cmd = f.cmd;
@@ -740,7 +961,68 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
     upload_->record(cmd);
+    ui_->prepare(cmd, slot_); // font atlas rows rasterised since the last frame
+    // GPU timing: every pass is always opened and closed (empty when skipped) so the scope
+    // list keeps the order of kGpuPassNames
+    auto gpuPass = [&](std::size_t index) {
+        if (index > 0) gpuProfiler_->end(cmd, slot_);
+        gpuProfiler_->begin(cmd, slot_, kGpuPassNames[index].data());
+    };
+    gpuPass(0);
 
+    // 0. sun shadow atlas: one cascade per quadrant
+    PushConstants pc{};
+    pc.frame = f.data.address;
+    pc.materials = f.data.address + matOffset;
+    pc.instances = f.data.address + instOffset;
+    pc.vertices = meshes_->vertexHeap().buffer().address;
+    u32 draws = 0;
+    if (cascadeCount_) {
+        barrier(cmd, shadowAtlas_.image, VK_IMAGE_ASPECT_DEPTH_BIT, kAll, kAnyRead,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_READ_BIT, VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
+        VkRenderingAttachmentInfo sd{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        sd.imageView = shadowAtlas_.view;
+        sd.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        sd.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        sd.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        sd.clearValue.depthStencil = {1.0f, 0};
+        VkRenderingInfo sri{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        sri.renderArea = {{0, 0}, {shadowAtlasSize_, shadowAtlasSize_}};
+        sri.layerCount = 1;
+        sri.pDepthAttachment = &sd;
+        vkCmdBeginRendering(cmd, &sri);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, bindless_->pipelineLayout, 0, 1, &bindless_->set, 0, nullptr);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipe_);
+        vkCmdBindIndexBuffer(cmd, meshes_->indexHeap().buffer().buffer, 0, VK_INDEX_TYPE_UINT16);
+        const u32 half = shadowAtlasSize_ / 2;
+        for (u32 c = 0; c < cascadeCount_; ++c) {
+            const VkViewport svp{float((c & 1) * half), float((c >> 1) * half), float(half), float(half), 0, 1};
+            const VkRect2D ssc{{i32((c & 1) * half), i32((c >> 1) * half)}, {half, half}};
+            vkCmdSetViewport(cmd, 0, 1, &svp);
+            vkCmdSetScissor(cmd, 0, 1, &ssc);
+            pc.cascade = c;
+            for (const Cmd& sc : shadowCmds[c]) {
+                pc.material = sc.draw->material;
+                vkCmdPushConstants(cmd, bindless_->pipelineLayout, VK_SHADER_STAGE_ALL, 0, sizeof(pc), &pc);
+                vkCmdDrawIndexed(cmd, sc.draw->indexCount, sc.count, sc.draw->firstIndex, i32(sc.draw->vertexOffset), sc.firstInstance);
+                ++draws;
+            }
+        }
+        pc.cascade = 0;
+        vkCmdEndRendering(cmd);
+        barrier(cmd, shadowAtlas_.image, VK_IMAGE_ASPECT_DEPTH_BIT, VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    } else if (shadowFresh_ && shadowAtlasSize_) {
+        // never rendered yet: give the descriptor a valid layout
+        barrier(cmd, shadowAtlas_.image, VK_IMAGE_ASPECT_DEPTH_BIT, kAll, kAnyRead, kAll, kAnyRead, VK_IMAGE_LAYOUT_UNDEFINED,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    shadowFresh_ = false;
+
+    gpuPass(1);
     const bool msaa = samples_ != VK_SAMPLE_COUNT_1_BIT;
     const phx::Image& scene = msaa ? sceneResolve_ : sceneColor_;
     // 1. scene at render resolution: HDR colour (+ MSAA resolve), motion vectors, depth
@@ -772,7 +1054,17 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     colors[1].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
     colors[1].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     colors[1].clearValue.color = {{0.0f, 0.0f, 0.0f, 0.0f}};
+    const bool ssaoOn = settings_.ssao && (motion_ || depthResolve_.image);
+    if (msaa && ssaoOn)
+        barrier(cmd, depthResolve_.image, VK_IMAGE_ASPECT_DEPTH_BIT, kAll, kAnyRead | kAnyWrite,
+                VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL);
     VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    if (msaa && ssaoOn) {
+        depth.resolveMode = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;
+        depth.resolveImageView = depthResolve_.view;
+        depth.resolveImageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+    }
     depth.imageView = depth_.view;
     depth.imageLayout = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
     depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
@@ -789,12 +1081,6 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     vkCmdSetViewport(cmd, 0, 1, &vp);
     vkCmdSetScissor(cmd, 0, 1, &ri.renderArea);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, bindless_->pipelineLayout, 0, 1, &bindless_->set, 0, nullptr);
-    PushConstants pc{};
-    pc.frame = f.data.address;
-    pc.materials = f.data.address + matOffset;
-    pc.instances = f.data.address + instOffset;
-    pc.vertices = meshes_->vertexHeap().buffer().address;
-    u32 draws = 0;
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, background_);
     vkCmdPushConstants(cmd, bindless_->pipelineLayout, VK_SHADER_STAGE_ALL, 0, sizeof(pc), &pc);
     vkCmdDraw(cmd, 32 * 12, 1, 0, 0);
@@ -820,18 +1106,42 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     }
     vkCmdEndRendering(cmd);
 
-    // scene inputs → readable
-    barrier(cmd, scene.image, kColorAspect, kColorOut, kColorWrite, kAll, kAnyRead, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-    if (motion_) {
+    // scene inputs → readable (ambient occlusion is multiplied into the scene first)
+    gpuPass(2);
+    if (ssaoOn) {
+        const phx::Image& dimg = msaa ? depthResolve_ : depth_;
+        barrier(cmd, dimg.image, VK_IMAGE_ASPECT_DEPTH_BIT, VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, kAll, kAnyRead, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        barrier(cmd, scene.image, kColorAspect, kColorOut, kColorWrite, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_LAYOUT_GENERAL);
+        phx::SsaoParams sp;
+        sp.nearPlane = kNear;
+        sp.projX = proj[0][0];
+        sp.projY = proj[1][1];
+        sp.radius = settings_.ssaoRadius;
+        sp.intensity = settings_.ssaoStrength;
+        sp.maxDistance = std::min(250.0f, settings_.viewDistance);
+        sp.frame = u32(frameNumber_);
+        ssao_->record(cmd, sp);
+        barrier(cmd, scene.image, kColorAspect, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT, kAll, kAnyRead,
+                VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    } else {
+        barrier(cmd, scene.image, kColorAspect, kColorOut, kColorWrite, kAll, kAnyRead, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    }
+    if (motion_)
         barrier(cmd, motionImg_.image, kColorAspect, kColorOut, kColorWrite, kAll, kAnyRead, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    if (motion_ && !ssaoOn) {
         barrier(cmd, depth_.image, VK_IMAGE_ASPECT_DEPTH_BIT, VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
                 VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, kAll, kAnyRead, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
     }
 
     // 2. upscaling / temporal AA → output-resolution HDR
+    gpuPass(3);
     if (phx::isDlss(upMode_)) {
         barrier(cmd, output_.image, kColorAspect, kAll, kAnyRead, kAll, kAnyRead | kAnyWrite, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
         phx::UpscaleInputs in;
@@ -862,8 +1172,12 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     //    UI-only image and the final image are all needed.
     const VkRect2D full{{0, 0}, dext};
     const VkViewport dvp{0, 0, float(dext.width), float(dext.height), 0, 1};
+    gpuPass(4);
+    if (settings_.bloom > 0.0f) bloom_->record(cmd); // reads TEX_HDR (output resolution)
     auto drawTonemap = [&](VkCommandBuffer c) {
         vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_GRAPHICS, tonemap_);
+        vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_GRAPHICS, bindless_->pipelineLayout, 0, 1, &bindless_->set, 0, nullptr);
+        vkCmdPushConstants(c, bindless_->pipelineLayout, VK_SHADER_STAGE_ALL, 0, sizeof(pc), &pc);
         vkCmdDraw(c, 3, 1, 0, 0);
     };
     auto beginPass = [&](const phx::Image& target, bool clear) {
@@ -898,8 +1212,14 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
         beginPass(sceneOut, false);
         drawTonemap(cmd);
     }
-    if (!fg) ui_->record(cmd, slot_, dext);
+    if (!fg) {
+        vkCmdEndRendering(cmd);
+        gpuPass(5); // the UI goes into the same image: own pass so its cost shows
+        beginPass(sceneOut, false);
+        ui_->record(cmd, slot_, dext);
+    }
     vkCmdEndRendering(cmd);
+    if (fg) gpuPass(5);
     if (fg) {
         // final = HUD-less + UI; UI alone into a cleared image (premultiplied)
         barrier(cmd, hudless_.image, kColorAspect, kColorOut, kColorWrite, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
@@ -932,6 +1252,7 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     }
 
     // 4. blit to the swapchain: generated frames first (DLSS-G), then the rendered one
+    gpuPass(6);
     auto blitToSwap = [&](const phx::Image& src, VkImageLayout srcLayout, u32 image) {
         const VkImage dst = swapchain_->images[image];
         barrier(cmd, dst, kColorAspect, kAll, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
@@ -989,6 +1310,7 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     barrier(cmd, final_.image, kColorAspect, kAll, kAnyRead, VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_READ_BIT,
             VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     blitToSwap(final_, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, images[generated]);
+    gpuProfiler_->end(cmd, slot_);
 
     if (frameCheck_ && screenshotPath_.empty() && screenshotPending_.empty()) screenshotPath_ = "#check";
     if (!screenshotPath_.empty() && screenshotPending_.empty()) {
@@ -1005,9 +1327,10 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
         screenshotFence_ = f.fence;
     }
     VK_CHECK(vkEndCommandBuffer(cmd));
+    profiler_.lap(CpuStage::Record);
 
     // ---------------------------------------------------------------- submit + present
-    VkSemaphoreSubmitInfo waits[4]{}, signals[4]{};
+    std::array<VkSemaphoreSubmitInfo, 4> waits{}, signals{};
     for (u32 k = 0; k < acquiredCount; ++k) {
         waits[k] = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
         waits[k].semaphore = f.acquired[k];
@@ -1020,11 +1343,11 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     cbi.commandBuffer = cmd;
     VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
     si.waitSemaphoreInfoCount = acquiredCount;
-    si.pWaitSemaphoreInfos = waits;
+    si.pWaitSemaphoreInfos = waits.data();
     si.commandBufferInfoCount = 1;
     si.pCommandBufferInfos = &cbi;
     si.signalSemaphoreInfoCount = acquiredCount;
-    si.pSignalSemaphoreInfos = signals;
+    si.pSignalSemaphoreInfos = signals.data();
     VK_CHECK(vkQueueSubmit2(ctx_->graphics.queue, 1, &si, f.fence));
     bool outOfDate = false;
     for (u32 k = 0; k < acquiredCount; ++k) {
@@ -1038,6 +1361,7 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
         outOfDate |= r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR;
     }
     if (outOfDate) recreateSwapchain();
+    profiler_.lap(CpuStage::Submit);
     slot_ = (slot_ + 1) % kFrames;
     finishScreenshots();
 
@@ -1051,7 +1375,7 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
 
     // stats
     stats_.drawCalls = draws;
-    stats_.instances = u32(items_.size());
+    stats_.instances = u32(instances.size());
     stats_.textureBytes = textures_->residentBytes();
     stats_.textureRawBytes = textures_->uncompressedBytes();
     stats_.textureCount = textures_->residentCount();
@@ -1062,9 +1386,14 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     stats_.indexCapacity = meshes_->indexHeap().capacity() * sizeof(u16);
     stats_.meshesResident = meshes_->residentCount();
     stats_.meshesPending = meshes_->pendingCount();
+    stats_.jobs = pool_.load();
+    stats_.presentedPerFrame = fgCount_ + 1;
+    const auto& gpu = gpuProfiler_->smoothed();
+    stats_.gpuTimed = gpu.size() == kGpuPassNames.size();
+    for (std::size_t i = 0; i < stats_.gpuMs.size(); ++i) stats_.gpuMs[i] = i < gpu.size() ? f32(gpu[i].second) : 0.0f;
     if (frameNumber_ % 30 == 0) {
-        VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
-        vmaGetHeapBudgets(ctx_->allocator, budgets);
+        std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets;
+        vmaGetHeapBudgets(ctx_->allocator, budgets.data());
         VkPhysicalDeviceMemoryProperties mp;
         vkGetPhysicalDeviceMemoryProperties(ctx_->physicalDevice, &mp);
         stats_.vramUsage = stats_.vramBudget = 0;

@@ -3,10 +3,12 @@
 // by (path, variant) and parsed lazily, on whichever thread asks (streaming workers): the
 // route can reference thousands of files while only the ones near the camera are in memory.
 #include "bve/Object.hpp"
+#include "util/Expected.hpp"
 
 #include <atomic>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -35,6 +37,10 @@ struct ObjectRecord {
     glm::vec3 bmin{0.0f}, bmax{0.0f};
     f32 radius = 0.0f;    // bounding sphere radius around the object origin
     u32 triangles = 0;
+    bool generated = false; // built in memory (cab primitives): never re-parsed from a file
+    // Procedural object (terrain): built by this function on a loader thread whenever it is
+    // needed, and dropped / rebuilt like a file object.
+    std::function<StaticMesh()> build;
     std::string error;
 };
 
@@ -50,6 +56,12 @@ public:
     // Parses the file now on the calling thread (no-op if already loaded / loading elsewhere).
     // Returns true when the record is Ready afterwards.
     bool load(ObjectId id);
+    // Registers a mesh built in memory under a unique key (Ready immediately).
+    ObjectId addMesh(const std::string& key, std::shared_ptr<StaticMesh> mesh);
+    // Registers an animated object built in memory (its states registered with addMesh / addProcedural).
+    ObjectId addAnimated(const std::string& key, std::shared_ptr<AnimatedDef> def, f32 radius);
+    // Registers a procedural object (built lazily by `build`, thread-safe callable).
+    ObjectId addProcedural(const std::string& key, std::function<StaticMesh()> build);
     // Releases the CPU mesh (after GPU upload); the record goes back to Unloaded when
     // `forget` (so a later request re-parses it), else stays Ready with bounds only.
     void releaseMesh(ObjectId id, bool forget);
@@ -66,6 +78,6 @@ private:
 };
 
 // .animated loader: fills `out`; state objects are interned into `lib` (not loaded).
-bool loadAnimated(const std::filesystem::path& path, AnimatedDef& out, ObjectLibrary& lib, std::string& error, int depth = 0);
+Expected<AnimatedDef> loadAnimated(const std::filesystem::path& path, ObjectLibrary& lib, int depth = 0);
 
 } // namespace ots

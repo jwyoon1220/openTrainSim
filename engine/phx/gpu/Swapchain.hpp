@@ -27,6 +27,7 @@ public:
 
     VkSwapchainKHR handle = VK_NULL_HANDLE;
     VkFormat format = VK_FORMAT_UNDEFINED;
+    VkPresentModeKHR presentMode = VK_PRESENT_MODE_FIFO_KHR; // what the policy got
     VkExtent2D extent{};
     std::vector<VkImage> images;
     std::vector<VkImageView> views;

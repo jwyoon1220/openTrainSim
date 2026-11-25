@@ -1,0 +1,51 @@
+// Example 3D cab (docs/cab-api.md):  openTrainSim <route.csv> --cab examples/cab/cab.json
+// A train uses its own cab by shipping <train folder>/cab.json next to its model.
+//
+// The cab is a 3D model (desk.glb, glTF 2.0 as exported by Blender). This file only says which
+// node of the model does what; geometry, pivots and materials come from the model.
+// (desk.glb itself is a small test model written by tools/example_cab_glb.py.)
+{
+  "name": "example desk",
+
+  // The model's origin is the cab floor under the driver's eye (eye at 0, 1.2, 0 in the model),
+  // so it is placed from train.dat's driver position and fits any train.
+  "model": { "file": "desk.glb", "origin": "driver", "at": [0, -1.2, 0] },
+
+  "elements": [
+    // one-handle master controller: back = brake / EB, forward = power. Drag or mouse wheel.
+    { "type": "lever", "node": "MasterLever", "hit": "MasterLever_Hit", "tooltip": "주간제어기 (드래그 / 휠)",
+      "bind": "onehandle", "axis": "x", "angles": [-40, 40] },
+    { "type": "switch", "node": "Reverser", "tooltip": "역전기 (클릭: 앞 / 우클릭: 뒤)",
+      "bind": "reverser", "axis": "y", "angles": [-45, 45] },
+
+    { "type": "button", "node": "Btn_DoorLeft",   "tooltip": "출입문 열기/닫기 (좌)", "bind": "doors_left",  "travel": 0.006 },
+    { "type": "button", "node": "Btn_DoorRight",  "tooltip": "출입문 열기/닫기 (우)", "bind": "doors_right", "travel": 0.006 },
+    { "type": "button", "node": "Btn_Horn",       "tooltip": "기적",                 "bind": "horn1",       "travel": 0.006 },
+    { "type": "button", "node": "Btn_Ack",        "tooltip": "확인 (A1)",            "bind": "key:A1",      "travel": 0.006 },
+    { "type": "button", "node": "Btn_Headlights", "tooltip": "전조등",               "bind": "headlights",  "travel": 0.006, "toggle": true },
+    { "type": "button", "node": "Btn_EB",         "tooltip": "비상제동",             "bind": "emergency",   "travel": 0.006, "toggle": true },
+
+    // needles turn about their node's z axis: 135° at 0, -135° at full scale (as printed on the dial)
+    { "type": "gauge", "node": "Needle_Speed", "tooltip": "속도계",
+      "value": "speedometer * 3.6", "max": 320, "angles": [135, -135], "damping": 0.15 },
+    { "type": "gauge", "node": "Needle_SpeedLimit", "tooltip": "제한속도",
+      "value": "routeLimit * 3.6", "max": 320, "angles": [135, -135], "damping": 0.5 },
+    { "type": "gauge", "node": "Needle_BC", "tooltip": "제동통 압력 (kPa)",
+      "value": "brakeCylinder / 1000", "max": 500, "angles": [135, -135], "damping": 0.15 },
+    { "type": "gauge", "node": "Needle_MR", "tooltip": "원공기통 압력 (kPa)",
+      "value": "mainReservoir / 1000", "max": 1000, "angles": [135, -135], "damping": 0.15 },
+
+    // lamps: off / on nodes; the value picks the node
+    { "type": "lamp", "nodes": ["Lamp_DoorsClosed_Off", "Lamp_DoorsClosed_On"], "tooltip": "출입문 닫힘", "value": "doors == 0" },
+    { "type": "lamp", "nodes": ["Lamp_EB_Off", "Lamp_EB_On"], "tooltip": "비상제동", "value": "emergencyBrake" },
+    { "type": "lamp", "nodes": ["Lamp_ATP_Off", "Lamp_ATP_On"], "tooltip": "최대 상용제동",
+      "value": "brakeNotch >= brakeNotches" },
+    { "type": "lamp", "nodes": ["Lamp_Overspeed_Off", "Lamp_Overspeed_On"], "tooltip": "과속 (깜빡임)",
+      "value": "if[speedometer > routeLimit + 0.3, mod[time, 1] < 0.5, 0]" }
+  ],
+
+  // condition -> message / sound, on the rising edge (or every "repeat" seconds while it holds)
+  "alerts": [
+    { "when": "speedometer > routeLimit + 1.4", "message": "과속! 제한속도를 지키세요", "seconds": 3, "repeat": 5 }
+  ]
+}

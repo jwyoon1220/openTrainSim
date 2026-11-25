@@ -8,10 +8,10 @@
 namespace ots {
 
 bool Config::load(const std::filesystem::path& path) {
-    std::string text;
-    if (!readTextFile(path, text)) return false;
+    const auto text = readTextFile(path);
+    if (!text) return false;
     std::string section;
-    for (const std::string& raw : splitLines(text)) {
+    for (const std::string& raw : splitLines(*text)) {
         std::string_view line = trim(raw);
         if (line.empty() || line.front() == ';' || line.front() == '#') continue;
         if (line.front() == '[' && line.back() == ']') {
@@ -44,13 +44,11 @@ std::string Config::get(const std::string& section, const std::string& key, cons
 }
 
 double Config::getNumber(const std::string& section, const std::string& key, double def) const {
-    double v;
-    return parseDouble(get(section, key), v) ? v : def;
+    return parseDouble(get(section, key)).value_or(def);
 }
 
 int Config::getInt(const std::string& section, const std::string& key, int def) const {
-    int v;
-    return parseIntVb6(get(section, key), v) ? v : def;
+    return parseIntVb6(get(section, key)).value_or(def);
 }
 
 bool Config::getBool(const std::string& section, const std::string& key, bool def) const {

@@ -9,6 +9,7 @@
 
 #include <glm/gtc/quaternion.hpp>
 
+#include <array>
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -107,7 +108,7 @@ struct PRailCycle {
     int cycle = -1, current = 0;
 };
 struct PBlock {
-    int background = -1;
+    std::optional<u32> background; // Track.Back in this block
     Fog fog;
     bool fogDefined = false;
     std::vector<int> cycle;
@@ -191,10 +192,10 @@ struct Parser {
         }
     }
 
-    bool readFile(const std::filesystem::path& p, std::string& text) {
-        if (!readTextFile(p, text)) return false;
-        ++stats.files;
-        return true;
+    std::optional<std::string> readFile(const std::filesystem::path& p) {
+        auto text = readTextFile(p);
+        if (text) ++stats.files;
+        return text;
     }
 
     // $Include / $Chr / $Rnd / $Sub / $If (openBVE PreprocessChrRndSub).
@@ -217,8 +218,8 @@ struct Parser {
                 }
                 if (k > t.size()) break;
                 const std::string name = lower(trim(std::string_view(t).substr(std::size_t(j) + 1, k - std::size_t(j) - 1)));
-                static const char* known[] = {"if", "elseif", "else", "endif", "include", "chr", "chrascii", "rnd", "sub"};
-                if (std::none_of(std::begin(known), std::end(known), [&](const char* n) { return name == n; })) break;
+                static constexpr std::array<std::string_view, 9> known{"if", "elseif", "else", "endif", "include", "chr", "chrascii", "rnd", "sub"};
+                if (std::ranges::find(known, name) == known.end()) break;
                 int l = 1;
                 std::size_t h = k + 1;
                 for (; h < t.size(); ++h) {
@@ -232,12 +233,12 @@ struct Parser {
                 }
                 const std::string s(trim(std::string_view(t).substr(k + 1, h - k - 1)));
                 if (name == "if" || name == "elseif") {
-                    double num;
                     exprs[i].text.clear();
                     next = true;
-                    if (!parseDouble(s, num)) break;
+                    const auto condition = parseDouble(s);
+                    if (!condition) break;
                     ++openIfs;
-                    if (num == 0.0) {
+                    if (*condition == 0.0) {
                         ++i;
                         int level = 1;
                         while (i < exprs.size()) {
@@ -301,11 +302,13 @@ struct Parser {
                         std::string_view arg = trim(args[2 * ia]);
                         double off = 0.0;
                         if (auto colon = arg.find(':'); colon != std::string_view::npos) {
-                            if (!parseDouble(arg.substr(colon + 1), off)) {
+                            const auto parsed = parseDouble(arg.substr(colon + 1));
+                            if (!parsed) {
                                 warn(exprs[i], "invalid include offset");
                                 bad = true;
                                 break;
                             }
+                            off = *parsed;
                             arg = trim(arg.substr(0, colon));
                         }
                         std::filesystem::path f = resolvePath(files[exprs[i].file].parent_path(), arg);
@@ -314,8 +317,7 @@ struct Parser {
                             bad = true;
                             break;
                         }
-                        double w = 1.0;
-                        if (2 * ia + 1 < args.size() && !parseDoubleVb6(args[2 * ia + 1], w)) w = 1.0;
+                        const double w = 2 * ia + 1 < args.size() ? parseDoubleVb6(args[2 * ia + 1]).value_or(1.0) : 1.0;
                         incFiles.push_back(f);
                         weights.push_back(w);
                         offsets.push_back(off);
@@ -332,23 +334,24 @@ struct Parser {
                         if (acc > pick) break;
                     }
                     chosen = std::min(chosen, incFiles.size() - 1);
-                    std::string text;
                     exprs[i].skip = true;
-                    if (!readFile(incFiles[chosen], text)) {
+                    const auto text = readFile(incFiles[chosen]);
+                    if (!text) {
                         warn(exprs[i], "cannot read include {}", incFiles[chosen].string());
                         break;
                     }
                     files.push_back(incFiles[chosen]);
                     std::vector<Expr> sub;
-                    splitIntoExpressions(u32(files.size() - 1), text, offsets[chosen] + exprs[i].offset, sub);
+                    splitIntoExpressions(u32(files.size() - 1), *text, offsets[chosen] + exprs[i].offset, sub);
                     exprs.insert(exprs.begin() + std::ptrdiff_t(i), std::make_move_iterator(sub.begin()), std::make_move_iterator(sub.end()));
                     if (!sub.empty()) --i;
                 } else if (name == "chr" || name == "chrascii") {
-                    int x;
-                    if (!parseIntVb6(s, x) || x < 0 || x > 0x10FFFF) {
+                    const auto code = parseIntVb6(s);
+                    if (!code || *code < 0 || *code > 0x10FFFF) {
                         next = true;
                         break;
                     }
+                    const int x = *code;
                     std::string u;
                     if (x < 0x80) u = char(x);
                     else if (x < 0x800) u = {char(0xC0 | (x >> 6)), char(0x80 | (x & 0x3F))};
@@ -357,12 +360,12 @@ struct Parser {
                     t = t.substr(0, std::size_t(j)) + u + t.substr(h + 1);
                 } else if (name == "rnd") {
                     auto parts = split(s, ';');
-                    int x = 0, y = 0;
-                    if (parts.size() >= 2 && parseIntVb6(parts[0], x) && parseIntVb6(parts[1], y)) {
-                        const int z = x + int(std::floor(std::uniform_real_distribution<double>(0.0, 1.0)(rng) * (y - x + 1)));
+                    const auto lo = parts.size() >= 2 ? parseIntVb6(parts[0]) : std::nullopt, hi = parts.size() >= 2 ? parseIntVb6(parts[1]) : std::nullopt;
+                    if (lo && hi) {
+                        const int z = *lo + int(std::floor(std::uniform_real_distribution<double>(0.0, 1.0)(rng) * (*hi - *lo + 1)));
                         t = t.substr(0, std::size_t(j)) + std::to_string(z) + t.substr(h + 1);
-                    } else if (parseIntVb6(s, x)) {
-                        t = t.substr(0, std::size_t(j)) + std::to_string(x) + t.substr(h + 1);
+                    } else if (const auto x = parseIntVb6(s)) {
+                        t = t.substr(0, std::size_t(j)) + std::to_string(*x) + t.substr(h + 1);
                     } else {
                         next = true;
                     }
@@ -377,11 +380,12 @@ struct Parser {
                         }
                         if (!std::isspace(static_cast<unsigned char>(t[m]))) break;
                     }
-                    int x;
-                    if (!parseIntVb6(s, x) || x < 0) {
+                    const auto index = parseIntVb6(s);
+                    if (!index || *index < 0) {
                         next = true;
                         break;
                     }
+                    const int x = *index;
                     if (std::size_t(x) >= subs.size()) subs.resize(std::size_t(x) + 1);
                     if (assign) {
                         subs[std::size_t(x)] = std::string(trim(std::string_view(t).substr(m + 1)));
@@ -468,7 +472,11 @@ struct Parser {
     }
 
     // Applies With-prefix, ".Load" style suffixes and indices. Returns false for no command.
-    bool normalise(std::string& cmd, const std::string& section, bool alwaysPrefix, int idx[2]) {
+    // Command indices: Name(a; b) → {a, b} (0 when absent).
+    using Indices = std::array<int, 2>;
+    // Puts the section prefix on `cmd` and strips its indices; nullopt for an empty or
+    // malformed command.
+    std::optional<Indices> normalise(std::string& cmd, const std::string& section, bool alwaysPrefix) {
         if (!cmd.empty() && cmd.front() == '.') cmd = section + cmd;
         else if (alwaysPrefix) cmd = section + "." + cmd;
         if (auto p = ifind(cmd, ".void"); p != std::string::npos) cmd.erase(p, 5);
@@ -480,18 +488,23 @@ struct Parser {
         if (lc.starts_with("cycle")) stripSuffix(".params");
         if (lc.starts_with("route.signal") || lc.starts_with("train.run") || lc.starts_with("train.flange")) stripSuffix(".set");
         if (lower(cmd).starts_with("texture.")) cmd = "structure." + cmd.substr(8);
-        idx[0] = idx[1] = 0;
+        Indices idx{0, 0};
         if (!cmd.empty() && cmd.back() == ')') {
             const std::size_t k = cmd.rfind('(');
             if (k != std::string::npos) {
                 const std::string inner(trim(std::string_view(cmd).substr(k + 1, cmd.size() - k - 2)));
                 cmd = std::string(trim(std::string_view(cmd).substr(0, k)));
                 const auto parts = split(inner, ';');
-                if (!parts.empty() && !trim(parts[0]).empty() && !parseIntVb6(parts[0], idx[0])) return false;
-                if (parts.size() > 1 && !trim(parts[1]).empty() && !parseIntVb6(parts[1], idx[1])) return false;
+                for (std::size_t n = 0; n < idx.size() && n < parts.size(); ++n) {
+                    if (trim(parts[n]).empty()) continue;
+                    const auto v = parseIntVb6(parts[n]);
+                    if (!v) return std::nullopt;
+                    idx[n] = *v;
+                }
             }
         }
-        return !cmd.empty();
+        if (cmd.empty()) return std::nullopt;
+        return idx;
     }
 
     // -------------------------------------------------------------- options & sorting
@@ -508,26 +521,22 @@ struct Parser {
                 always = false;
                 continue;
             }
-            int idx[2];
-            if (!normalise(cmd, section, always, idx)) continue;
+            if (!normalise(cmd, section, always)) continue;
             const std::string lc = lower(cmd);
             const auto a = splitArgs(args);
             if (lc == "options.unitoflength") {
                 unitFactors.clear();
                 for (const auto& s : a) {
-                    double f;
-                    unitFactors.push_back(parseDoubleVb6(s, f) && f > 0 ? f : 1.0);
+                    const double f = parseDoubleVb6(s).value_or(0.0);
+                    unitFactors.push_back(f > 0 ? f : 1.0);
                 }
                 if (unitFactors.empty()) unitFactors = {1.0};
             } else if (lc == "options.unitofspeed") {
-                double f;
-                if (!a.empty() && parseDoubleVb6(a[0], f) && f > 0) unitOfSpeed = f / 3.6;
+                if (const double f = a.empty() ? 0.0 : parseDoubleVb6(a[0]).value_or(0.0); f > 0) unitOfSpeed = f / 3.6;
             } else if (lc == "options.blocklength") {
-                double f;
-                if (!a.empty() && parseDoubleVb6(a[0], f) && f > 0) route.blockLength = f;
+                if (const double f = a.empty() ? 0.0 : parseDoubleVb6(a[0]).value_or(0.0); f > 0) route.blockLength = f;
             } else if (lc == "options.sectionbehavior") {
-                int v;
-                if (!a.empty() && parseIntVb6(a[0], v)) valueBasedSections = v == 1;
+                if (const auto v = a.empty() ? std::nullopt : parseIntVb6(a[0])) valueBasedSections = *v == 1;
             }
         }
     }
@@ -539,10 +548,8 @@ struct Parser {
         std::vector<std::pair<double, std::size_t>> keyed;
         for (Expr& e : exprs) {
             if (e.skip) continue;
-            double x;
-            if (parseLength(e.text, unitFactors, x)) {
-                x += e.offset;
-                if (x >= 0.0) a = x;
+            if (const auto position = parseLength(e.text, unitFactors)) {
+                if (const double x = *position + e.offset; x >= 0.0) a = x;
                 continue;
             }
             if (pa != a) {
@@ -578,22 +585,22 @@ struct Parser {
         return p;
     }
 
-    static double parseTime(std::string_view s) {
+    // openBVE time "HH.MMSS" (or "HH") → seconds since midnight.
+    static std::optional<double> parseTime(std::string_view s) {
         s = trim(s);
-        if (s.empty()) return -1.0;
         const auto dot = s.find('.');
-        int h;
-        if (dot == std::string_view::npos) {
-            if (!parseIntVb6(s, h)) return -1.0;
-            return h * 3600.0;
-        }
-        if (!parseIntVb6(s.substr(0, dot), h)) return -1.0;
+        const auto h = parseIntVb6(s.substr(0, dot));
+        if (s.empty() || !h) return std::nullopt;
+        if (dot == std::string_view::npos) return *h >= 0 ? std::optional(*h * 3600.0) : std::nullopt;
         std::string frac(s.substr(dot + 1));
-        while (frac.size() < 4) frac.push_back('0');
-        int mm = 0, ss = 0;
-        parseIntVb6(frac.substr(0, 2), mm);
-        parseIntVb6(frac.substr(2, 2), ss);
-        return h * 3600.0 + mm * 60.0 + ss;
+        frac.resize(std::max<std::size_t>(frac.size(), 4), '0');
+        const double t = *h * 3600.0 + parseIntVb6(frac.substr(0, 2)).value_or(0) * 60.0 + parseIntVb6(frac.substr(2, 2)).value_or(0);
+        return t >= 0.0 ? std::optional(t) : std::nullopt;
+    }
+
+    void addIntervals(const std::vector<std::string>& a) {
+        for (const std::string& x : a)
+            if (const double v = x.empty() ? 0.0 : parseDoubleVb6(x).value_or(0.0); v != 0.0) route.runIntervals.push_back(v);
     }
 
     void nonTrackPass() {
@@ -611,15 +618,15 @@ struct Parser {
             }
             std::string cmd, args;
             separate(e.text, cmd, args);
-            double tmp;
-            if (parseLength(cmd, unitFactors, tmp)) continue;
+            if (parseLength(cmd, unitFactors)) continue;
             if (iequals(cmd, "with")) {
                 section = args;
                 always = false;
                 continue;
             }
-            int idx[2];
-            if (!normalise(cmd, section, always, idx)) continue;
+            const auto indices = normalise(cmd, section, always);
+            if (!indices) continue;
+            const Indices idx = *indices;
             const auto period = cmd.find('.');
             std::string ns = period == std::string::npos ? std::string() : lower(cmd.substr(0, period));
             std::string c = lower(period == std::string::npos ? cmd : cmd.substr(period + 1));
@@ -628,10 +635,7 @@ struct Parser {
                 ns.clear();
             }
             const auto a = splitArgs(args);
-            auto num = [&](std::size_t i, double def) {
-                double v;
-                return (i < a.size() && !a[i].empty() && parseDoubleVb6(a[i], v)) ? v : def;
-            };
+            auto num = [&](std::size_t i, double def) { return i < a.size() && !a[i].empty() ? parseDoubleVb6(a[i]).value_or(def) : def; };
             if (ns == "route") {
                 if (c == "comment") route.comment = args;
                 else if (c == "timetable") route.timetable = args;
@@ -653,10 +657,13 @@ struct Parser {
                     const double s = num(0, 0), en = num(1, 0);
                     if (s < en) route.initialFog = {float(s), float(en), u32(num(2, 128)) | (u32(num(3, 128)) << 8) | (u32(num(4, 128)) << 16)};
                 } else if (c == "starttime") {
-                    route.startTime = a.empty() ? -1.0 : parseTime(a[0]);
+                    route.startTime = a.empty() ? std::nullopt : parseTime(a[0]);
+                } else if (c == "runinterval") {
+                    addIntervals(a);
                 }
             } else if (ns == "train") {
                 if ((c == "folder" || c == "file") && !args.empty()) route.trainFolder = args;
+                else if (c == "interval") addIntervals(a);
             else if ((c == "run" || c == "rail") && idx[0] >= 0) {
                 if (route.runSounds.size() <= std::size_t(idx[0])) route.runSounds.resize(std::size_t(idx[0]) + 1, 0);
                 route.runSounds[std::size_t(idx[0])] = std::max(0, int(num(0, 0)));
@@ -724,10 +731,7 @@ struct Parser {
                 }
             } else if (ns == "cycle") {
                 std::vector<int> list;
-                for (const auto& s : a) {
-                    int v;
-                    list.push_back(parseIntVb6(s, v) ? v : 0);
-                }
+                for (const auto& s : a) list.push_back(parseIntVb6(s).value_or(0));
                 if (c == "ground") groundCycles[idx[0]] = list;
                 else if (c == "rail") railCycles[idx[0]] = list;
             } else if (ns == "options" || ns == "track") {
@@ -748,7 +752,7 @@ struct Parser {
         while (int(blocks.size()) <= to) {
             const PBlock& p = blocks.back();
             PBlock b;
-            b.background = -1;
+            b.background.reset();
             b.fog = p.fog;
             b.cycle = p.cycle;
             b.railCycles = p.railCycles;
@@ -837,8 +841,7 @@ struct Parser {
                 always = false;
                 continue;
             }
-            int idx[2];
-            if (!normalise(cmd, section, always, idx)) continue;
+            if (!normalise(cmd, section, always)) continue;
             const auto period = cmd.find('.');
             if (period == std::string::npos || !iequals(cmd.substr(0, period), "track")) continue;
             const std::string c = lower(cmd.substr(period + 1));
@@ -848,14 +851,8 @@ struct Parser {
 
     void trackCommand(const Expr& e, const std::string& c, const std::vector<std::string>& a, int bi) {
         PBlock& b = blocks[std::size_t(bi)];
-        auto num = [&](std::size_t i, double def) {
-            double v;
-            return (i < a.size() && !a[i].empty() && parseDoubleVb6(a[i], v)) ? v : def;
-        };
-        auto inum = [&](std::size_t i, int def) {
-            int v;
-            return (i < a.size() && !a[i].empty() && parseIntVb6(a[i], v)) ? v : def;
-        };
+        auto num = [&](std::size_t i, double def) { return i < a.size() && !a[i].empty() ? parseDoubleVb6(a[i]).value_or(def) : def; };
+        auto inum = [&](std::size_t i, int def) { return i < a.size() && !a[i].empty() ? parseIntVb6(a[i]).value_or(def) : def; };
         auto railStarted = [&](int idx) {
             auto it = b.rails.find(idx);
             return it != b.rails.end() && it->second.started;
@@ -923,7 +920,7 @@ struct Parser {
             b.fogDefined = true;
         } else if (c == "back" || c == "background") {
             const int t = inum(0, 0);
-            if (t >= 0 && std::size_t(t) < route.backgrounds.size() && !route.backgrounds[std::size_t(t)].texture.empty()) b.background = t;
+            if (t >= 0 && std::size_t(t) < route.backgrounds.size() && !route.backgrounds[std::size_t(t)].texture.empty()) b.background = u32(t);
         } else if (c == "freeobj") {
             if (a.size() < 2) return;
             const int idx = inum(0, 0), t = inum(1, 0);
@@ -995,15 +992,12 @@ struct Parser {
         } else if (c == "section" || c == "sections" || c == "sectionp") {
             Section s;
             s.trackPos = trackPosition;
-            for (const std::string& arg : a) {
-                int v;
-                s.aspects.push_back(parseIntVb6(arg, v) && v >= 0 ? v : -1);
-            }
+            for (const std::string& arg : a) s.aspects.push_back(std::max(-1, parseIntVb6(arg).value_or(-1)));
             if (s.aspects.empty()) s.aspects = {0};
             s.type = (valueBasedSections || c == "sections") ? SectionType::ValueBased : SectionType::IndexBased;
             if (s.type == SectionType::ValueBased) std::sort(s.aspects.begin(), s.aspects.end());
             if (currentStation >= 0 && route.stations[std::size_t(currentStation)].forcedRedSignal && currentStop >= 0 && !departureSignalUsed) {
-                s.departureStation = currentStation;
+                s.departureStation = std::size_t(currentStation);
                 departureSignalUsed = true;
             }
             route.sections.push_back(std::move(s));
@@ -1083,12 +1077,12 @@ struct Parser {
                 bc.type = inum(0, 0);
                 const int section = inum(2, 0);
                 bc.optional = inum(3, 0);
-                bc.section = section == -1 ? -1 : (section < 0 ? currentSection + 1 : currentSection + section);
+                if (section != -1) bc.section = std::size_t(section < 0 ? currentSection + 1 : currentSection + section);
             } else { // Track.Transponder type;signal;switch → beacon type 0..4 (openBVE mapping)
                 bc.type = inum(0, 0);
                 const int sig = inum(1, 0);
                 bc.optional = inum(2, 0);
-                bc.section = sig < 0 ? -1 : currentSection + sig + 1;
+                if (sig >= 0) bc.section = std::size_t(currentSection + sig + 1);
             }
             if (bc.type >= 0) route.beacons.push_back(bc);
         } else if (c == "announce") {
@@ -1117,7 +1111,7 @@ struct Parser {
     std::vector<std::vector<Placement>> blockPlacements;
     std::vector<glm::dvec3> blockOrigins;
 
-    void place(int block, ObjectId obj, const glm::dvec3& world, const glm::dmat3& rot, double trackPos, int section = -1) {
+    void place(int block, ObjectId obj, const glm::dvec3& world, const glm::dmat3& rot, double trackPos, std::optional<u32> section = std::nullopt) {
         if (obj == kNoObject) return;
         Placement p;
         p.object = obj;
@@ -1159,7 +1153,7 @@ struct Parser {
         const double L = route.blockLength;
         glm::dvec3 position(0.0);
         glm::dvec2 dir(0.0, 1.0);
-        int lastBackground = route.backgrounds.empty() ? -1 : 0;
+        std::optional<u32> lastBackground = route.backgrounds.empty() ? std::nullopt : std::optional<u32>(0);
         Fog fog = route.initialFog;
 
         for (int i = 0; i < nBlocks; ++i) {
@@ -1205,7 +1199,7 @@ struct Parser {
             rb.curveRadius = B.curveRadius;
             rb.cant = B.cant;
             blockOrigins[std::size_t(i)] = position;
-            if (B.background >= 0) lastBackground = B.background;
+            if (B.background) lastBackground = B.background;
             rb.background = lastBackground;
             if (B.fogDefined) fog = B.fog;
             rb.fogStart = fog.start;
@@ -1364,7 +1358,7 @@ struct Parser {
                         const glm::dvec3 w = pos + s.x * railT.X + s.y * railT.Y + dz * railT.Z;
                         auto it = signalObj.find(s.type);
                         if (it == signalObj.end()) continue;
-                        place(i, lib.intern(it->second), w, toMat(compose(railT, s.yaw, s.pitch, s.roll)), s.trackPos, s.section);
+                        place(i, lib.intern(it->second), w, toMat(compose(railT, s.yaw, s.pitch, s.roll)), s.trackPos, u32(s.section));
                     }
                 }
             }
@@ -1510,23 +1504,23 @@ Fog Route::fogAt(double t) const {
     return Fog{b.fogStart, b.fogEnd, b.fogColor};
 }
 
-int Route::backgroundAt(double t) const {
-    if (blocks.empty()) return -1;
+std::optional<std::size_t> Route::backgroundAt(double t) const {
+    if (blocks.empty()) return std::nullopt;
     return blocks[std::size_t(blockAt(t))].background;
 }
 
-int Route::sectionAt(double t) const {
-    int s = -1;
-    for (std::size_t i = 0; i < sections.size(); ++i) {
-        if (sections[i].trackPos > t) break;
-        s = int(i);
-    }
-    return s;
+std::optional<std::size_t> Route::sectionAt(double t) const {
+    // sections are in track order: the last one starting at or before t
+    const auto after = std::ranges::upper_bound(sections, t, {}, &Section::trackPos);
+    if (after == sections.begin()) return std::nullopt;
+    return std::size_t(after - sections.begin()) - 1;
 }
 
-bool loadRoute(const std::filesystem::path& file, ObjectLibrary& lib, Route& out, RouteLoadStats& stats, std::string& error) {
+Expected<LoadedRoute> loadRoute(const std::filesystem::path& file, ObjectLibrary& lib) {
     const auto t0 = std::chrono::steady_clock::now();
-    out = Route{};
+    LoadedRoute result;
+    Route& out = result.route;
+    RouteLoadStats& stats = result.stats;
     out.file = file;
     std::filesystem::path railway = findUpwards(file.parent_path(), "Railway");
     if (railway.empty()) railway = file.parent_path().parent_path();
@@ -1536,16 +1530,13 @@ bool loadRoute(const std::filesystem::path& file, ObjectLibrary& lib, Route& out
     if (out.soundFolder.empty()) out.soundFolder = railway / "Sound";
     out.trainFolderHint = findUpwards(file.parent_path(), "Train");
     // openBVE's initial section: red until the first Track.Section.
-    out.sections.push_back(Section{0.0, {0, 4}, SectionType::IndexBased, -1, 4});
+    out.sections.push_back(Section{.trackPos = 0.0, .aspects = {0, 4}, .type = SectionType::IndexBased, .currentAspect = 4});
 
     Parser p(lib, out, stats);
-    std::string text;
-    if (!p.readFile(file, text)) {
-        error = "cannot read route file " + file.string();
-        return false;
-    }
+    const auto text = p.readFile(file);
+    if (!text) return Unexpected("cannot read route file " + file.string());
     p.files.push_back(file);
-    p.splitIntoExpressions(0, text, 0.0, p.exprs);
+    p.splitIntoExpressions(0, *text, 0.0, p.exprs);
     p.preprocess();
     p.preprocessOptions();
     p.sortByPosition();
@@ -1566,7 +1557,7 @@ bool loadRoute(const std::filesystem::path& file, ObjectLibrary& lib, Route& out
     p.trackPass();
     p.apply();
     stats.parseSeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    return true;
+    return result;
 }
 
 } // namespace ots

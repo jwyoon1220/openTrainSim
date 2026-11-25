@@ -1,13 +1,17 @@
 #pragma once
+#include "util/Expected.hpp"
 // Train safety-system plugins (ATS / ATC / ATP / TVM ...) written against openBVE's managed
-// API (OpenBveApi.Runtime.IRuntime). They run unmodified in a separate Mono process
-// (tools/PluginHost) — the same isolation openBVE uses for Win32 plugins — and talk to the
-// simulator over pipes, one request / reply per frame.
+// API (OpenBveApi.Runtime.IRuntime). They run unmodified in a separate .NET process
+// (tools/PluginHost: Mono on Linux, the .NET Framework on Windows) — the same isolation openBVE
+// uses for Win32 plugins — and talk to the simulator over pipes, one request / reply per frame.
 #include <filesystem>
 #include <string>
+#include <string_view>
+#include <span>
+#include <optional>
+#include <chrono>
+#include <cstdint>
 #include <vector>
-
-#include <sys/types.h>
 
 namespace ots {
 
@@ -46,7 +50,7 @@ struct PluginSoundCommand {
     enum class Kind { Play, Set, Stop } kind = Kind::Play;
     int handle = 0;      // host-assigned id, unique for the plugin's lifetime
     int index = 0;       // [Ats] sound index in sound.cfg (Play)
-    int car = -1;        // -1 = driver car panel position (PlaySound), else car index (PlayCarSound)
+    std::optional<int> car; // none: the panel position in the driver car (PlaySound), else a car (PlayCarSound)
     double volume = 1.0, pitch = 1.0;
     bool looped = false; // Play
 };
@@ -54,13 +58,21 @@ struct PluginSoundCommand {
 class TrainPlugin {
 public:
     ~TrainPlugin();
-    // Starts the host and loads `dll`. Returns false with `error` set on failure.
-    bool start(const std::filesystem::path& hostExe, const std::filesystem::path& dll, const std::filesystem::path& trainFolder,
-               int powerNotches, int brakeType, int brakeNotches, bool holdBrake, int cars, int initMode,
-               const std::vector<PluginStation>& stations, std::string& error);
-    [[nodiscard]] bool running() const { return pid_ > 0; }
-    // One frame: driver handles + vehicle state in, safety handles + panel out.
-    bool elapse(const PluginVehicle& v, PluginHandles& out);
+    // What the plugin is told about the train and the route when it loads.
+    struct Setup {
+        int powerNotches = 0, brakeType = 0, brakeNotches = 0;
+        bool holdBrake = false;
+        int cars = 1;
+        int initMode = -1; // openBVE InitializationModes
+        std::vector<PluginStation> stations;
+    };
+    // Starts the host and loads `dll`.
+    Expected<void> start(const std::filesystem::path& hostExe, const std::filesystem::path& dll, const std::filesystem::path& trainFolder,
+                         const Setup& setup);
+    [[nodiscard]] bool running() const;
+    // One frame: driver handles + vehicle state in, safety handles out (panel, messages,
+    // sounds ... updated); nullopt when the host is gone.
+    std::optional<PluginHandles> elapse(const PluginVehicle& v);
     void setReverser(int r), setPower(int p), setBrake(int b);
     void keyDown(int virtualKey), keyUp(int virtualKey);
     void horn(int type);
@@ -80,11 +92,27 @@ public:
     void soundEnded(int handle);
 
 private:
-    bool send(const std::string& line);
-    bool readLine(std::string& line);
-    pid_t pid_ = -1;
+    bool send(std::string_view line);
+    std::optional<std::string> readLine(); // nullopt: host gone or hung
+    // Platform pipe I/O (sim/Plugin.cpp).
+    Expected<void> spawn(const std::filesystem::path& hostExe, const std::filesystem::path& dll, const std::filesystem::path& trainFolder);
+    bool writeAll(std::string_view bytes);
+    struct ReadResult {
+        enum class Status : std::uint8_t { Data, Timeout, Closed };
+        Status status;
+        std::size_t bytes = 0;
+    };
+    ReadResult readSome(std::span<char> buffer, std::chrono::milliseconds timeout);
+    void closeHost();
+#ifdef _WIN32
+    void* process_ = nullptr;           // HANDLE
+    void* in_ = nullptr, *out_ = nullptr; // our write end (host stdin), our read end (host stdout)
+#else
+    int pid_ = -1;
     int in_ = -1, out_ = -1; // our write end (host stdin), our read end (host stdout)
-    std::string buffer_;
+#endif
+    std::string buffer_;                 // received, not yet split into lines
+    std::vector<char> chunk_ = std::vector<char>(65536); // read scratch
 };
 
 // Locates the plugin named in the train's ats.cfg (or the first .dll in the folder).

@@ -1,0 +1,3 @@
+// Windows resources for MinGW builds (MSVC takes openTrainSim.manifest directly).
+#include <winuser.h>
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "openTrainSim.manifest"

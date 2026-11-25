@@ -1,0 +1,25 @@
+; 시험용 차체: 20 m, 폭 2.9 m, 레일면 위 1.0~4.0 m
+CreateMeshBuilder
+Cube, 1.45, 1.5, 9.9
+Translate, 0, 2.5, 0
+SetColor, 225, 228, 232
+CreateMeshBuilder
+Cube, 1.46, 0.45, 9.0
+Translate, 0, 2.95, 0
+SetColor, 40, 50, 64
+CreateMeshBuilder
+Cube, 1.47, 0.12, 9.9
+Translate, 0, 2.05, 0
+SetColor, 0, 112, 190
+CreateMeshBuilder
+Cube, 1.2, 0.35, 1.4
+Translate, 0, 0.55, 6.6
+SetColor, 45, 45, 48
+CreateMeshBuilder
+Cube, 1.2, 0.35, 1.4
+Translate, 0, 0.55, -6.6
+SetColor, 45, 45, 48
+CreateMeshBuilder
+Cube, 0.9, 0.5, 0.05
+Translate, 0, 2.95, 9.92
+SetColor, 30, 38, 50

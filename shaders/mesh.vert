@@ -6,6 +6,7 @@ layout(location = 2) out vec3 vView;   // camera-relative position
 layout(location = 3) out float vBrightness;
 layout(location = 4) out vec4 vCur;
 layout(location = 5) out vec4 vPrev;
+layout(location = 6) flat out float vRepeat;
 
 void main() {
     Vertex v = VertexRef(pc.vertices).v[gl_VertexIndex];
@@ -15,6 +16,7 @@ void main() {
     mat3 rot = transpose(mat3(inst.row0.xyz, inst.row1.xyz, inst.row2.xyz));
     vNormal = rot * octDecode(v.normal);
     vUv = v.uv + inst.params.xy;
+    vRepeat = inst.params.w;
     vView = world;
     vBrightness = inst.params.z;
     Frame fr = FrameRef(pc.frame).f;

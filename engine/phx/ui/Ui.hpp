@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -32,13 +33,20 @@ struct Insets {
     f32 bottom = 0;
     f32 right = 0;
 };
-struct Vertex {
-    f32 x;
-    f32 y;
-    f32 z;
-    u32 rgba;
+struct Point {
+    f32 x = 0;
+    f32 y = 0;
 };
-static_assert(sizeof(Vertex) == 16);
+// Triangle-list vertex (phx::UiRenderer draws vertices in threes).
+struct Vertex {
+    f32 x, y;             // pixels, top-left origin
+    f32 u, v;             // texture coordinates
+    u32 rgba;             // display-encoded colour (premultiplied-free; see rgba())
+    u32 clipMin, clipMax; // clip rectangle in pixels, packed x | y << 16 (fragments outside are discarded)
+    u32 texture;          // 0: font atlas (u, v sample coverage; solid fills use its white texel)
+                          // else: bindless sampled slot whose colour multiplies `rgba`
+};
+static_assert(sizeof(Vertex) == 32);
 
 constexpr u32 rgba(u8 r, u8 g, u8 b, u8 a = 255) {
     return u32(r) | (u32(g) << 8u) | (u32(b) << 16u) | (u32(a) << 24u);
@@ -57,6 +65,8 @@ struct Theme {
     u32 selection = rgba(45, 92, 150);
     u32 shadow = rgba(0, 0, 0, 110);
     f32 textScale = 2.0f;
+    f32 fontSize = 0.0f; // pixels per em for TrueType text; 0 = derived from textScale
+    f32 cornerRadius = 4.0f; // windows, buttons, fields
     f32 padding = 8.0f;
     f32 rowHeight = 28.0f;
     f32 titleHeight = 30.0f;
@@ -93,13 +103,41 @@ class Component;
 class Container;
 class Ui;
 
+// Immediate-mode drawing into a triangle list: rectangles, TrueType text (stb_truetype; the
+// stb_easy_font bitmap font when no font file is found) and anti-aliased vector shapes.
+// Vector shapes get a 1-pixel coverage fringe, so edges are smooth without MSAA.
 class Painter {
   public:
     Painter(std::vector<Vertex> &vertices, const Theme &theme, Rect clip);
     void pushClip(Rect clip);
     void popClip();
+    [[nodiscard]] Rect clip() const {
+        return clips_.back();
+    }
+
+    // --- rectangles (pixel-aligned, no fringe)
     void fillRect(Rect rect, u32 colour);
+    void fillRectGradient(Rect rect, u32 top, u32 bottom); // vertical
     void drawBorder(Rect rect, u32 colour, f32 thickness = 1.0f);
+    // `texture`: a bindless sampled slot; `uv` the part of it to show
+    void drawImage(Rect rect, u32 texture, u32 tint = 0xFFFFFFFFu, Rect uv = {0, 0, 1, 1});
+
+    // --- vector shapes (anti-aliased)
+    void fillRoundedRect(Rect rect, f32 radius, u32 colour);
+    void strokeRoundedRect(Rect rect, f32 radius, f32 width, u32 colour);
+    void fillCircle(Point centre, f32 radius, u32 colour);
+    void strokeCircle(Point centre, f32 radius, f32 width, u32 colour);
+    // Arc from angle a0 to a1 (radians, 0 = +x, clockwise on screen since y points down).
+    void strokeArc(Point centre, f32 radius, f32 a0, f32 a1, f32 width, u32 colour);
+    // Pie slice / annulus sector filled between two radii (inner 0 = pie).
+    void fillSector(Point centre, f32 inner, f32 outer, f32 a0, f32 a1, u32 colour);
+    void drawLine(Point a, Point b, f32 width, u32 colour);
+    void strokePolyline(std::span<const Point> points, f32 width, u32 colour, bool closed = false);
+    // Convex polygon, either winding.
+    void fillConvex(std::span<const Point> points, u32 colour);
+    void fillTriangle(Point a, Point b, Point c, u32 colour);
+
+    // --- text (y = top of the line box, lineHeight() tall)
     void drawText(f32 x, f32 y, std::string_view text, u32 colour);
     void drawText(f32 x, f32 y, const std::string &text, u32 colour);
     void drawText(f32 x, f32 y, const char *text, u32 colour);
@@ -110,13 +148,22 @@ class Painter {
     }
 
   private:
-    void drawTerminatedText(f32 x, f32 y, const char *text, std::size_t length, u32 colour);
+    void vertex(f32 x, f32 y, f32 u, f32 v, u32 colour, u32 texture = 0);
+    void quad(Rect r, Rect uv, u32 colour, u32 texture = 0); // clipped on the CPU
+    void triangle(Point a, Point b, Point c, u32 ca, u32 cb, u32 cc);
+    void bitmapText(f32 x, f32 y, std::string_view text, u32 colour);
     std::vector<Vertex> &vertices_;
     const Theme &theme_;
     std::vector<Rect> clips_;
-    std::string textBuffer_;
-    std::vector<std::array<f32, 16>> glyphBuffer_;
+    u32 clipMin_ = 0, clipMax_ = 0;
+    std::vector<Point> path_, inner_, outer_;
 };
+
+// Pixels per em of TrueType text for a theme.
+f32 fontPixels(const Theme &theme);
+// Outline of a rounded rectangle / circle as a closed polygon (appended to `out`).
+void roundedRectPath(Rect rect, f32 radius, std::vector<Point> &out);
+void arcPath(Point centre, f32 radius, f32 a0, f32 a1, std::vector<Point> &out);
 
 class LayoutManager {
   public:
@@ -559,6 +606,7 @@ class Ui {
     void bringToFront(Window &window);
     void windowHidden(Window &window);
     Theme theme_;
+    u32 fontGeneration_ = 0;
     Size screen_{};
     std::vector<std::unique_ptr<Window>> windows_;
     Component *hover_ = nullptr;

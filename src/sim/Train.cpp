@@ -36,6 +36,11 @@ void TrainSim::placeAt(double frontTrackPosition) {
     updateCars();
 }
 
+void TrainSim::setFront(double f) {
+    front = f;
+    updateCars();
+}
+
 void TrainSim::command(Command c) {
     const bool oneHandle = def_.spec.handleType == HandleType::OneHandle;
     auto toPower = [&] { // single handle towards power
@@ -238,12 +243,11 @@ void TrainSim::updateCars() {
     }
 }
 
-void TrainSim::driverPose(glm::dvec3& pos, glm::dvec3& X, glm::dvec3& Y, glm::dvec3& Z) const {
+TrainSim::DriverView TrainSim::driverPose() const {
     const int dc = std::clamp(def_.spec.driverCar, 0, int(cars.size()) - 1);
     const CarPose& c = cars[std::size_t(dc)];
     const glm::dvec3 d = def_.cars[std::size_t(dc)].driver;
-    pos = c.position + c.X * d.x + c.Y * d.y + c.Z * d.z;
-    X = c.X, Y = c.Y, Z = c.Z;
+    return {c.position + c.X * d.x + c.Y * d.y + c.Z * d.z, c.X, c.Y, c.Z};
 }
 
 } // namespace ots

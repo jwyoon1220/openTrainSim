@@ -4,6 +4,8 @@
 
 #include <glm/glm.hpp>
 
+#include <array>
+
 namespace ots {
 using namespace phx;
 
@@ -18,18 +20,17 @@ static_assert(sizeof(GpuVertex) == 24);
 // Camera-relative 3×4 transform (rows) + per-instance parameters.
 struct GpuInstance {
     glm::vec4 row0, row1, row2;
-    glm::vec4 params; // xy: texture shift, z: brightness, w: unused
+    glm::vec4 params; // xy: texture shift (in [0, 1)), z: brightness, w: 1 = sample repeating (shifted)
     glm::vec4 prev;   // xyz: previous camera-relative position − current (motion vectors)
 };
 static_assert(sizeof(GpuInstance) == 80);
 
-enum MaterialFlags : u32 {
-    kMatTextured = 1u << 0,
-    kMatAlphaTest = 1u << 1,
-    kMatBlend = 1u << 2,
-    kMatAdditive = 1u << 3,
-    kMatGlowShift = 16, // bits 16..31: glow half distance (m)
-};
+// GpuMaterial::flags bits (shaders/common.glsl reads the same values)
+inline constexpr u32 kMatTextured = 1u << 0;
+inline constexpr u32 kMatAlphaTest = 1u << 1;
+inline constexpr u32 kMatBlend = 1u << 2;
+inline constexpr u32 kMatAdditive = 1u << 3;
+inline constexpr u32 kMatGlowShift = 16; // bits 16..31: glow half distance (m)
 
 struct GpuMaterial {
     u32 texture; // bindless slot (0 = white fallback)
@@ -50,6 +51,11 @@ struct GpuFrame {
     glm::vec4 fogColor;
     glm::vec4 background;   // radius, y0, y1, repetitions
     glm::vec4 misc;         // x: background texture slot, y: background alpha, z: time, w: mip bias
+    std::array<glm::mat4, 4> shadow;        // camera-relative → shadow clip, per cascade
+    std::array<glm::vec4, 4> shadowCascade; // x: texel world size, y: far split
+    glm::vec4 shadowParams;      // x: cascades (0 = off), y: atlas texels, z: atlas slot, w: strength
+    glm::vec4 lighting;          // x: hemisphere ambient 0..1, y: sun specular
+    glm::vec4 post;              // x: bloom, y: saturation, z: contrast, w: vignette
 };
 
 struct PushConstants {
@@ -58,7 +64,8 @@ struct PushConstants {
     u64 instances; // GpuInstance*
     u64 materials; // GpuMaterial*
     u32 material;
-    u32 pad[3];
+    u32 cascade; // shadow pass
+    std::array<u32, 2> pad;
 };
 static_assert(sizeof(PushConstants) == 48);
 

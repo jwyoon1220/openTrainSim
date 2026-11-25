@@ -2,11 +2,14 @@
 
 #include "phx/core/Log.hpp"
 #include "util/Paths.hpp"
+#include "util/Platform.hpp"
 #include "util/Text.hpp"
 
 #include <GLFW/glfw3.h>
 
+#include <array>
 #include <algorithm>
+#include <cctype>
 #include <cstdlib>
 #include <fstream>
 #include <unordered_map>
@@ -16,9 +19,9 @@ namespace {
 
 struct CommandInfo {
     Command cmd;
-    const char* name;
+    std::string_view name;
 };
-constexpr CommandInfo kCommands[] = {
+constexpr auto kCommands = std::to_array<CommandInfo>({
     {Command::PowerIncrease, "POWER_INCREASE"}, {Command::PowerDecrease, "POWER_DECREASE"}, {Command::PowerFull, "POWER_FULL"},
     {Command::PowerNeutral, "POWER_NEUTRAL"}, {Command::BrakeIncrease, "BRAKE_INCREASE"}, {Command::BrakeDecrease, "BRAKE_DECREASE"},
     {Command::BrakeFull, "BRAKE_FULL"}, {Command::BrakeEmergency, "BRAKE_EMERGENCY"}, {Command::BrakeNeutral, "BRAKE_NEUTRAL"},
@@ -49,7 +52,7 @@ constexpr CommandInfo kCommands[] = {
     {Command::MiscQuit, "MISC_QUIT"}, {Command::MiscFullscreen, "MISC_FULLSCREEN"}, {Command::MiscMute, "MISC_MUTE"},
     {Command::MiscInterface, "MISC_INTERFACE"}, {Command::MiscBackface, "MISC_BACKFACE"}, {Command::MiscCpuMode, "MISC_CPUMODE"},
     {Command::RouteInformation, "ROUTE_INFORMATION"},
-};
+});
 
 const std::unordered_map<std::string, int>& keyTable() {
     static const std::unordered_map<std::string, int> t = [] {
@@ -64,7 +67,7 @@ const std::unordered_map<std::string, int>& keyTable() {
             m["kp_" + std::to_string(i)] = GLFW_KEY_KP_0 + i;
         }
         for (int i = 1; i <= 25; ++i) m["f" + std::to_string(i)] = GLFW_KEY_F1 + i - 1;
-        const std::pair<const char*, int> named[] = {
+        constexpr auto named = std::to_array<std::pair<std::string_view, int>>({
             {"keypaddivide", GLFW_KEY_KP_DIVIDE}, {"kp_divide", GLFW_KEY_KP_DIVIDE}, {"keypadmultiply", GLFW_KEY_KP_MULTIPLY},
             {"kp_multiply", GLFW_KEY_KP_MULTIPLY}, {"keypadminus", GLFW_KEY_KP_SUBTRACT}, {"keypadsubtract", GLFW_KEY_KP_SUBTRACT},
             {"kp_minus", GLFW_KEY_KP_SUBTRACT}, {"keypadplus", GLFW_KEY_KP_ADD}, {"keypadadd", GLFW_KEY_KP_ADD}, {"kp_plus", GLFW_KEY_KP_ADD},
@@ -82,8 +85,8 @@ const std::unordered_map<std::string, int>& keyTable() {
             {"tilde", GLFW_KEY_GRAVE_ACCENT}, {"grave", GLFW_KEY_GRAVE_ACCENT}, {"backquote", GLFW_KEY_GRAVE_ACCENT},
             {"capslock", GLFW_KEY_CAPS_LOCK}, {"scrolllock", GLFW_KEY_SCROLL_LOCK}, {"numlock", GLFW_KEY_NUM_LOCK},
             {"printscreen", GLFW_KEY_PRINT_SCREEN}, {"print", GLFW_KEY_PRINT_SCREEN}, {"pause", GLFW_KEY_PAUSE}, {"menu", GLFW_KEY_MENU},
-        };
-        for (auto [n, k] : named) m[n] = k;
+        });
+        for (auto [n, k] : named) m[std::string(n)] = k;
         return m;
     }();
     return t;
@@ -91,10 +94,14 @@ const std::unordered_map<std::string, int>& keyTable() {
 
 } // namespace
 
-const char* commandName(Command c) {
-    for (const CommandInfo& i : kCommands)
-        if (i.cmd == c) return i.name;
-    return "?";
+std::optional<Command> commandFromName(std::string_view name) {
+    const auto it = std::ranges::find_if(kCommands, [&](const CommandInfo& i) { return iequals(i.name, name); });
+    return it != kCommands.end() ? std::optional(it->cmd) : std::nullopt;
+}
+
+std::string_view commandName(Command c) {
+    const auto it = std::ranges::find(kCommands, c, &CommandInfo::cmd);
+    return it != kCommands.end() ? it->name : "?";
 }
 
 int glfwKeyFromName(std::string_view name) {
@@ -112,7 +119,7 @@ std::string keyName(int key) {
 }
 
 void Controls::loadDefaults() {
-    static const char* kDefault = R"(POWER_INCREASE, keyboard, Z, 0
+    static constexpr std::string_view kDefault = R"(POWER_INCREASE, keyboard, Z, 0
 POWER_DECREASE, keyboard, A, 0
 BRAKE_DECREASE, keyboard, Comma, 0
 BRAKE_INCREASE, keyboard, Period, 0
@@ -198,9 +205,7 @@ ROUTE_INFORMATION, keyboard, F8, 0
         if (f.size() < 4) continue;
         for (const CommandInfo& i : kCommands)
             if (iequals(trim(f[0]), i.name)) {
-                int mods = 0;
-                parseIntVb6(f[3], mods);
-                bindings_.push_back({i.cmd, glfwKeyFromName(f[2]), mods});
+                bindings_.push_back({i.cmd, glfwKeyFromName(f[2]), parseIntVb6(f[3]).value_or(0)});
             }
     }
 }
@@ -221,18 +226,17 @@ std::vector<KeyBinding> Controls::parse(const std::string& text, int* unknownKey
             if (unknownKeys) ++*unknownKeys;
             continue;
         }
-        int mods = 0;
-        if (f.size() >= 4) parseIntVb6(f[3], mods);
+        const int mods = f.size() >= 4 ? parseIntVb6(f[3]).value_or(0) : 0;
         b.push_back({info->cmd, key, mods});
     }
     return b;
 }
 
 bool Controls::loadFile(const std::filesystem::path& file) {
-    std::string text;
-    if (!readTextFile(file, text)) return false;
+    const auto text = readTextFile(file);
+    if (!text) return false;
     int unknownKeys = 0;
-    std::vector<KeyBinding> b = parse(text, &unknownKeys);
+    std::vector<KeyBinding> b = parse(*text, &unknownKeys);
     if (b.empty()) return false;
     bindings_ = std::move(b);
     if (unknownKeys) phx::log::warn("{}: {} bindings with unknown key names ignored", file.string(), unknownKeys);
@@ -240,9 +244,9 @@ bool Controls::loadFile(const std::filesystem::path& file) {
 }
 
 int Controls::mergeFile(const std::filesystem::path& file) {
-    std::string text;
-    if (!readTextFile(file, text)) return 0;
-    const std::vector<KeyBinding> extra = parse(text, nullptr);
+    const auto text = readTextFile(file);
+    if (!text) return 0;
+    const std::vector<KeyBinding> extra = parse(*text, nullptr);
     for (const KeyBinding& e : extra)
         std::erase_if(bindings_, [&](const KeyBinding& b) { return b.glfwKey == e.glfwKey && b.modifiers == e.modifiers; });
     bindings_.insert(bindings_.end(), extra.begin(), extra.end());
@@ -285,13 +289,19 @@ void Controls::commandsFor(int key, int glfwMods, std::vector<Command>& out) con
 }
 
 std::filesystem::path Controls::findOpenBveControls() {
-    const char* home = std::getenv("HOME");
-    if (!home) return {};
+    const std::filesystem::path home = userHomeDir();
+    if (home.empty()) return {};
     std::filesystem::path best;
     std::filesystem::file_time_type bestTime{};
     std::error_code ec;
-    for (const char* base : {".config/OpenBve/Settings", ".config/openBVE/Settings"}) {
-        const std::filesystem::path dir = std::filesystem::path(home) / base;
+#ifdef _WIN32
+    // openBVE on Windows: %APPDATA%\openBVE\Settings\<version>\controls.cfg
+    constexpr std::array<std::string_view, 2> bases{"AppData/Roaming/openBVE/Settings", "AppData/Roaming/OpenBve/Settings"};
+#else
+    constexpr std::array<std::string_view, 2> bases{".config/OpenBve/Settings", ".config/openBVE/Settings"};
+#endif
+    for (std::string_view base : bases) {
+        const std::filesystem::path dir = home / base;
         for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
             const std::filesystem::path c = e.path() / "controls.cfg";
             if (!std::filesystem::exists(c, ec)) continue;

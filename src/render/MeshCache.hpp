@@ -37,12 +37,15 @@ public:
               GeometrySettings settings);
     ~MeshCache();
 
-    // Starts loading (parse + pack on a worker) unless already loading / resident.
-    void request(ObjectId id, bool urgent = false);
-    // Static object: resident and all its textures settled → drawable. Marks it used.
-    const GpuMesh* drawable(ObjectId id, u64 frame);
-    // Animated object definition, once loaded (its states are requested automatically).
-    const AnimatedDef* animated(ObjectId id, u64 frame);
+    // Starts loading (parse + pack on a worker) unless already loading / resident; a queued
+    // load is raised if `priority` is more urgent than before. Its textures inherit it.
+    void request(ObjectId id, JobPriority priority = JobPriority::View);
+    // Static object: resident and all its textures settled → drawable. Marks it used and
+    // requests it at `priority` if it is not.
+    const GpuMesh* drawable(ObjectId id, u64 frame, JobPriority priority = JobPriority::View);
+    // Animated object definition, once loaded (its states are requested automatically, at
+    // Idle: the state on show is raised when drawn).
+    const AnimatedDef* animated(ObjectId id, u64 frame, JobPriority priority = JobPriority::View);
     [[nodiscard]] bool failed(ObjectId id) const;
     void update(u64 frame, double frameSeconds);
     // Marks all objects referenced by permanent things (train, cab) as never evicted.
@@ -52,6 +55,8 @@ public:
     [[nodiscard]] const phx::GpuHeap& indexHeap() const { return indices_; }
     [[nodiscard]] std::size_t residentCount() const { return resident_; }
     [[nodiscard]] std::size_t pendingCount() const { return inFlight_; }
+    // Loads still pending at `upTo` or more urgent (a scan: for the loading screen).
+    [[nodiscard]] std::size_t pendingCount(JobPriority upTo) const;
 
 private:
     enum class State : u8 { None, Loading, Resident, Failed };
@@ -59,6 +64,8 @@ private:
         State state = State::None;
         bool pinned = false;
         bool animated = false;
+        JobPriority priority = JobPriority::Idle; // most urgent request so far (this load)
+        JobTicket job;
         u64 lastUsed = 0;
         GpuMesh mesh;
     };

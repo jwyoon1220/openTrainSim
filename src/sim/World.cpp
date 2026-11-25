@@ -2,11 +2,11 @@
 
 #include "phx/core/Log.hpp"
 
-#include <cstdlib>
-#include <format>
-
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <format>
+#include <functional>
 #include <limits>
 
 namespace ots {
@@ -17,70 +17,144 @@ Simulation::Simulation(const Route& r, const TrainDef& def) : route(r) {
     stations.resize(r.stations.size());
 }
 
-void Simulation::start(int station) {
-    if (station < 0) {
-        for (std::size_t i = 0; i < route.stations.size(); ++i)
-            if (route.stations[i].stopsHere() && !route.stations[i].stops.empty()) {
-                station = int(i);
-                break;
-            }
+void Simulation::start(std::optional<std::size_t> station) {
+    if (!station) {
+        const auto first = std::ranges::find_if(route.stations, [](const Station& s) { return s.stopsHere() && !s.stops.empty(); });
+        if (first != route.stations.end()) station = std::size_t(first - route.stations.begin());
     }
+    const std::optional<std::size_t> startStation = station && *station < route.stations.size() ? station : std::nullopt;
     double frontPos = train->length() + 1.0;
-    if (station >= 0 && std::size_t(station) < route.stations.size()) {
-        const Station& s = route.stations[std::size_t(station)];
-        if (const StopPoint* sp = s.stopFor(int(train->def().cars.size()))) frontPos = sp->trackPos;
-        else frontPos = s.trackPos;
+    if (startStation) {
+        const Station& s = route.stations[*startStation];
+        frontPos = s.stopPosition(int(train->def().cars.size()));
         // openBVE: the clock starts at the arrival time (or departure − stop time).
-        if (s.arrival >= 0) time = s.arrival;
-        else if (s.departure >= 0) time = s.departure - s.stopDuration;
-        for (int i = 0; i <= station; ++i) stations[std::size_t(i)].passed = true;
-        StationProgress& p = stations[std::size_t(station)];
-        p.passed = false;
+        if (s.arrival) time = *s.arrival;
+        else if (s.departure) time = *s.departure - s.stopDuration;
+        for (std::size_t i = 0; i < *startStation; ++i) stations[i].passed = true;
+        StationProgress& p = stations[*startStation];
         p.arrived = true;
         p.doorsOpened = true;
         p.arrivalTime = time;
     }
-    if (route.startTime >= 0) time = route.startTime;
-    frontPos = std::max(frontPos, train->length() + 1.0);
-    train->placeAt(frontPos);
+    if (route.startTime) time = *route.startTime;
+    train->placeAt(std::max(frontPos, train->length() + 1.0));
+
+    // Preceding trains: run the traffic alone (the player is not there yet) from the earliest
+    // departure up to the start time, so they are where they would be now.
+    double earliest = time;
+    for (TrafficTrain& t : traffic) earliest = std::min(earliest, t.schedule(time, startStation));
+    if (earliest < time) {
+        runTrafficUntil(earliest);
+        // still standing where the player starts (interval shorter than the stop): it waits
+        // and enters behind the player instead
+        for (TrafficTrain& t : traffic)
+            if (t.active() && t.train().rear() < train->front + 1.0 && t.train().front > train->rear()) {
+                t.postpone(time);
+                phx::log::warn("Traffic {}: still at the start position, enters after the player", t.name());
+            }
+        separateTrains();
+    }
     updateStations(0.0);
     updateSections();
+    for (const TrafficTrain& t : traffic)
+        if (t.active())
+            phx::log::info("Traffic {}: {:.0f} m ({} m ahead), {:.0f} km/h", t.name(), t.train().front, int(t.train().front - train->front), t.train().speed * 3.6);
 }
 
-bool Simulation::startPlugin(const std::filesystem::path& hostExe, std::string& status) {
+void Simulation::runTrafficUntil(double from) {
+    const double now = time;
+    playerPresent_ = false;
+    for (time = from; time < now;) {
+        const double h = std::min(0.1, now - time);
+        updateTraffic(h);
+        time += h;
+        updateSections();
+    }
+    time = now;
+    playerPresent_ = true;
+}
+
+bool Simulation::spawnAreaClear(const TrafficTrain& t) const {
+    const double front = t.spawnFront(), lo = front - t.train().length() - 30.0, hi = front + 30.0;
+    bool clear = true;
+    forEachTrain([&](const TrainSim& o, auto&&, bool) { clear = clear && !(o.rear() < hi && o.front > lo); });
+    return clear;
+}
+
+void Simulation::updateTraffic(double dt) {
+    for (TrafficTrain& t : traffic)
+        if (t.due(time) && spawnAreaClear(t)) t.spawn(time); // waits until its platform is free
+    for (TrafficTrain& t : traffic)
+        if (t.active()) t.drive(*this);
+    // fixed physics sub-steps (stable handles / brakes at any frame rate)
+    const int steps = std::max(1, int(std::ceil(dt / (1.0 / 120.0))));
+    const double h = dt / steps;
+    for (int i = 0; i < steps; ++i) {
+        if (playerPresent_) train->update(h);
+        for (TrafficTrain& t : traffic)
+            if (t.active()) t.train().update(h);
+    }
+    separateTrains();
+}
+
+// Trains cannot pass through each other: whoever is behind stops at the rear of the one ahead.
+void Simulation::separateTrains() {
+    order_.clear();
+    if (playerPresent_) order_.push_back(train.get());
+    for (TrafficTrain& t : traffic)
+        if (t.active()) order_.push_back(&t.train());
+    std::ranges::sort(order_, std::greater{}, &TrainSim::front);
+    for (std::size_t k = 1; k < order_.size(); ++k) {
+        const TrainSim& ahead = *order_[k - 1];
+        TrainSim& behind = *order_[k];
+        const double limit = ahead.rear() - 0.3;
+        if (behind.front <= limit) continue;
+        if (behind.speed - ahead.speed > 1.0)
+            phx::log::warn("Collision at {:.0f} m ({:.0f} km/h){}", limit, (behind.speed - ahead.speed) * 3.6, &behind == train.get() ? " by the player" : "");
+        behind.setFront(limit);
+        behind.speed = std::min(behind.speed, ahead.speed);
+    }
+}
+
+Expected<void> Simulation::startPlugin(const std::filesystem::path& hostExe) {
     const TrainDef& def = train->def();
     const std::filesystem::path dll = findTrainPlugin(def.folder);
     if (dll.empty()) {
-        status = "no plugin (ats.cfg)";
-        return false;
+        pluginStatus = "no plugin (ats.cfg)";
+        return Unexpected(pluginStatus);
     }
-    std::vector<PluginStation> st;
+    const TrainSpec& spec = def.spec;
+    TrainPlugin::Setup setup{.powerNotches = spec.powerNotches,
+                             .brakeType = int(spec.brakeType),
+                             .brakeNotches = spec.brakeNotches,
+                             .holdBrake = spec.holdBrake,
+                             .cars = int(def.cars.size()),
+                             .initMode = int(route.safetyStart),
+                             .stations = {}};
     for (const Station& s : route.stations) {
         PluginStation p;
         p.name = s.name;
-        p.arrival = s.arrival, p.departure = s.departure;
+        p.arrival = s.arrival.value_or(-1.0), p.departure = s.departure.value_or(-1.0); // plugin protocol: -1 = none
         if (const StopPoint* sp = s.stopFor(int(def.cars.size()))) p.stop = sp->trackPos, p.forward = sp->forward, p.backward = sp->backward;
         p.left = s.doors <= 0, p.right = s.doors >= 0;
         p.mode = int(s.mode);
-        st.push_back(p);
+        setup.stations.push_back(std::move(p));
     }
     auto pl = std::make_unique<TrainPlugin>();
-    std::string err;
-    const TrainSpec& spec = def.spec;
-    if (!pl->start(hostExe, dll, def.folder, spec.powerNotches, int(spec.brakeType), spec.brakeNotches, spec.holdBrake, int(def.cars.size()),
-                   route.initMode, st, err)) {
-        status = dll.filename().string() + ": " + err;
-        return false;
+    if (const auto started = pl->start(hostExe, dll, def.folder, setup); !started) {
+        pluginStatus = dll.filename().string() + ": " + started.error();
+        return Unexpected(pluginStatus);
     }
     plugin = std::move(pl);
-    status = dll.filename().string() + " running";
+    pluginStatus = dll.filename().string() + " running";
     // openBVE places the train by moving it from the route start, so every beacon before the
     // start position (ATP level, route number, speed profile ...) reaches the plugin first.
     prevFront_ = -1.0e18;
-    return true;
+    return {};
 }
 
 void Simulation::pluginKey(int key, bool down) {
+    if (onboard && key == 0) onboard->acknowledge(down); // S: 확인 (acknowledge)
     if (!plugin || !plugin->running()) return;
     if (down) plugin->keyDown(key);
     else plugin->keyUp(key);
@@ -105,16 +179,17 @@ void Simulation::updatePlugin(double dt) {
         for (const Beacon& b : route.beacons) {
             if (b.trackPos <= lo) continue;
             if (b.trackPos > hi) break;
-            int idx = b.section;
-            if (idx == -1) { // next red section ahead
-                idx = route.sectionAt(t.front) + 1;
-                while (idx >= 0 && std::size_t(idx) < sections.size() && sections[std::size_t(idx)].pluginAspect != 0) ++idx;
+            std::size_t idx = b.section.value_or(0);
+            if (!b.section) { // next red section ahead
+                const auto cur = route.sectionAt(t.front);
+                idx = cur ? *cur + 1 : 0;
+                while (idx < sections.size() && sections[idx].pluginAspect != 0) ++idx;
             }
             int aspect = 0;
             double dist = 1.0e9;
-            if (idx >= 0 && std::size_t(idx) < sections.size()) {
-                aspect = sections[std::size_t(idx)].pluginAspect;
-                dist = sections[std::size_t(idx)].trackPos - t.front;
+            if (idx < sections.size()) {
+                aspect = sections[idx].pluginAspect;
+                dist = sections[idx].trackPos - t.front;
             }
             plugin->beacon(b.type, b.optional, aspect, dist);
             if (std::getenv("OTS_PLUGIN_TRACE")) phx::log::info("beacon {} {} at {:.0f} m (aspect {})", b.type, b.optional, b.trackPos, aspect);
@@ -122,9 +197,9 @@ void Simulation::updatePlugin(double dt) {
     prevFront_ = t.front;
     // signals ahead: from the current section up to the first red (max 16)
     {
-        const int cur = std::max(0, route.sectionAt(t.front));
+        const std::size_t cur = route.sectionAt(t.front).value_or(0);
         std::vector<std::pair<int, double>> sig;
-        for (std::size_t i = std::size_t(cur); i < sections.size() && sig.size() < 16; ++i) {
+        for (std::size_t i = cur; i < sections.size() && sig.size() < 16; ++i) {
             sig.push_back({sections[i].pluginAspect, sections[i].trackPos - t.front});
             if (sections[i].pluginAspect == 0) break;
         }
@@ -136,9 +211,9 @@ void Simulation::updatePlugin(double dt) {
     }
     // driver handle changes
     const int brk = t.emergency ? t.maxBrake() + 1 : t.brakeNotch;
-    if (t.reverser != lastRev_) plugin->setReverser(lastRev_ = t.reverser);
-    if (t.powerNotch != lastPow_) plugin->setPower(lastPow_ = t.powerNotch);
-    if (brk != lastBrk_) plugin->setBrake(lastBrk_ = brk);
+    if (lastRev_ != t.reverser) plugin->setReverser(*(lastRev_ = t.reverser));
+    if (lastPow_ != t.powerNotch) plugin->setPower(*(lastPow_ = t.powerNotch));
+    if (lastBrk_ != brk) plugin->setBrake(*(lastBrk_ = brk));
     // doors (openBVE DoorStates: 1 left, 2 right)
     const int doors = (t.leftDoors > 0.0 ? 1 : 0) | (t.rightDoors > 0.0 ? 2 : 0);
     if (doors != lastDoors_) plugin->doorChange(lastDoors_, doors), lastDoors_ = doors;
@@ -154,9 +229,9 @@ void Simulation::updatePlugin(double dt) {
     v.elapsedMs = dt * 1000.0;
     v.driver = {t.reverser, t.powerNotch, brk, t.constSpeed, t.holdBrake, 0, t.headlights ? 1 : 0};
     v.camera = cameraMode == 0 ? 2 : 8;
-    PluginHandles out;
-    if (plugin->elapse(v, out)) {
-        if (out.brake != lastSafetyBrake_ || out.power != lastSafetyPower_)
+    if (const auto handles = plugin->elapse(v)) {
+        const PluginHandles& out = *handles;
+        if (lastSafetyBrake_ != out.brake || lastSafetyPower_ != out.power)
             phx::log::info("plugin {:.0f} m {:.1f} km/h: driver P{} B{} -> safety P{} B{}{}", t.front, t.speed * 3.6, t.powerNotch, brk, out.power,
                            out.brake, out.brake > t.maxBrake() ? " (EB)" : "");
         lastSafetyBrake_ = out.brake, lastSafetyPower_ = out.power;
@@ -196,10 +271,8 @@ void Simulation::update(double dt) {
     if (paused) return;
     dt *= timeFactor;
     updatePlugin(dt);
-    // fixed physics sub-steps (stable handles / brakes at any frame rate)
-    const int steps = std::max(1, int(std::ceil(dt / (1.0 / 120.0))));
-    const double h = dt / steps;
-    for (int i = 0; i < steps; ++i) train->update(h);
+    if (onboard) onboard->update(safety::Trackside(route, sections), *train, dt);
+    updateTraffic(dt); // AI handles, then every train's physics
     time += dt;
     if (time >= 86400.0) time -= 86400.0;
     updateStations(dt);
@@ -210,16 +283,14 @@ void Simulation::update(double dt) {
 double Simulation::speedLimit() const {
     double lim = route.speedLimitAt(train->front);
     // signal speed of the section the train is in (Route.Signal(aspect))
-    const int s = route.sectionAt(train->front);
-    if (s >= 0) {
-        const int aspect = sections[std::size_t(s)].currentAspect;
+    if (const auto s = route.sectionAt(train->front)) {
+        const int aspect = sections[*s].currentAspect;
         if (aspect >= 0 && std::size_t(aspect) < route.signalSpeeds.size()) lim = std::min(lim, route.signalSpeeds[std::size_t(aspect)]);
     }
     return lim;
 }
 
 void Simulation::updateSections() {
-    const double front = train->front, rear = train->rear();
     const int n = int(sections.size());
     int freeAhead = 1 << 20; // beyond the last section: clear
     int nextAspect = std::numeric_limits<int>::max();
@@ -227,17 +298,24 @@ void Simulation::updateSections() {
         Section& s = sections[std::size_t(i)];
         const double start = s.trackPos;
         const double end = i + 1 < n ? sections[std::size_t(i) + 1].trackPos : std::numeric_limits<double>::infinity();
-        bool occupied = rear < end && front > start;
+        // occupancy by any train; the departure signal of a station is held at danger until
+        // the train approaching it (the nearest one behind) may depart from that station
+        bool occupied = false, otherTrain = false;
+        const std::vector<StationProgress>* approaching = nullptr;
+        double approachingFront = -std::numeric_limits<double>::infinity();
+        forEachTrain([&](const TrainSim& t, const std::vector<StationProgress>& progress, bool player) {
+            if (t.rear() < end && t.front > start) occupied = true, otherTrain = otherTrain || !player;
+            if (t.front <= start + 1.0 && t.front > approachingFront) approachingFront = t.front, approaching = &progress;
+        });
         bool held = false;
-        if (s.departureStation >= 0 && std::size_t(s.departureStation) < stations.size()) {
-            const StationProgress& p = stations[std::size_t(s.departureStation)];
-            // held at danger until the train may depart from that station
+        if (s.departureStation && *s.departureStation < stations.size() && approaching) {
+            const StationProgress& p = (*approaching)[*s.departureStation];
             if (!p.departed && !p.passed) occupied = held = true;
         }
         if (s.aspects.empty()) continue;
         // What the safety plugin sees (openBVE Section.GetPluginSignal): the player train's own
         // occupancy is ignored, so the section it is in shows the aspect it would have if free.
-        if (held) {
+        if (held || otherTrain) {
             s.pluginAspect = s.aspects.front();
         } else if (s.type == SectionType::ValueBased) {
             int a = s.aspects.back();
@@ -272,34 +350,32 @@ void Simulation::updateSections() {
     }
 }
 
-double Simulation::distanceToStop(int station) const {
-    if (station < 0 || std::size_t(station) >= route.stations.size()) return std::numeric_limits<double>::infinity();
-    const Station& s = route.stations[std::size_t(station)];
-    const StopPoint* sp = s.stopFor(int(train->def().cars.size()));
-    return (sp ? sp->trackPos : s.trackPos) - train->front;
+double Simulation::distanceToStop(std::size_t station) const {
+    if (station >= route.stations.size()) return std::numeric_limits<double>::infinity();
+    return route.stations[std::size_t(station)].stopPosition(int(train->def().cars.size())) - train->front;
 }
 
 void Simulation::updateStations(double) {
     // next station: first not yet passed/departed station ahead of the rear of the train
-    nextStation = -1;
+    nextStation.reset();
     for (std::size_t i = 0; i < route.stations.size(); ++i) {
         StationProgress& p = stations[i];
         if (p.passed || p.departed) continue;
-        const double d = distanceToStop(int(i));
+        const double d = distanceToStop(i);
         const Station& s = route.stations[i];
         const StopPoint* sp = s.stopFor(int(train->def().cars.size()));
         const double fwd = sp ? sp->forward : 5.0, back = sp ? sp->backward : 5.0;
         if (!s.stopsHere()) {
             if (d < -fwd) p.passed = true;
-            else if (nextStation < 0) nextStation = int(i);
+            else if (!nextStation) nextStation = i;
             continue;
         }
         if (d < -fwd - 50.0 && !p.arrived) {
             p.passed = true; // overran / skipped
             continue;
         }
-        if (nextStation < 0) nextStation = int(i);
-        if (int(i) != nextStation) continue;
+        if (!nextStation) nextStation = i;
+        if (i != *nextStation) continue;
         const bool inWindow = d <= back && d >= -fwd;
         if (!p.arrived && inWindow && std::abs(train->speed) < 0.05) {
             p.arrived = true;
@@ -308,7 +384,7 @@ void Simulation::updateStations(double) {
         }
         if (p.arrived) {
             if (train->leftDoors > 0.5 || train->rightDoors > 0.5) p.doorsOpened = true;
-            const bool timeOk = s.departure < 0 || time >= s.departure - 1.0;
+            const bool timeOk = !s.departure || time >= *s.departure - 1.0;
             const bool doorsOk = p.doorsOpened || s.doors == 0;
             if (timeOk && doorsOk && train->doorsClosed() && !s.terminal) p.departed = true;
             if (!inWindow && d < -fwd) p.departed = true; // left without the formalities
@@ -316,16 +392,10 @@ void Simulation::updateStations(double) {
     }
 }
 
-int Simulation::signalAhead(double& distance, int& aspect) const {
-    for (std::size_t i = 0; i < sections.size(); ++i)
-        if (sections[i].trackPos > train->front + 0.1) {
-            distance = sections[i].trackPos - train->front;
-            aspect = sections[i].currentAspect;
-            return int(i);
-        }
-    distance = std::numeric_limits<double>::infinity();
-    aspect = -1;
-    return -1;
+std::optional<Simulation::SignalAhead> Simulation::signalAhead() const {
+    const auto next = std::ranges::upper_bound(sections, train->front + 0.1, {}, &Section::trackPos);
+    if (next == sections.end()) return std::nullopt;
+    return SignalAhead{std::size_t(next - sections.begin()), next->trackPos - train->front, next->currentAspect};
 }
 
 f32 Simulation::cabBrightness() const {
@@ -340,7 +410,7 @@ f32 Simulation::cabBrightness() const {
 }
 
 double ScriptContext::variable(Var v, int index) const {
-    const TrainSim& t = *sim_.train;
+    const TrainSim& t = train ? *train : *sim_.train;
     const TrainSpec& s = t.def().spec;
     const int carIdx = index >= 0 ? index : car;
     auto pressure = [](double kpa) { return kpa * 1000.0; }; // openBVE scripts use Pa
@@ -395,6 +465,31 @@ double ScriptContext::variable(Var v, int index) const {
     case Var::PluginState:
         if (sim_.plugin && index >= 0 && std::size_t(index) < sim_.plugin->panel.size()) return sim_.plugin->panel[std::size_t(index)];
         return 0.0;
+    case Var::Safety: { // built-in train protection, docs/safety.md
+        if (!sim_.onboard) return index == 0 ? 0.0 : -1.0;
+        const safety::Display& d = sim_.onboard->display();
+        const auto kmh = [](const std::optional<double>& v) { return v ? *v * 3.6 : -1.0; };
+        switch (index) {
+        case 0: return sim_.onboard->active() ? double(int(*sim_.onboard->active()) + 1) : 0.0; // 1 ATS, 2 TVM430, 3 ATP
+        case 1: return kmh(d.permitted);
+        case 2: return kmh(d.target);
+        case 3: return d.targetDistance.value_or(-1.0);
+        case 4: return d.warning ? 1.0 : 0.0;
+        case 5: return d.braking ? 1.0 : 0.0;
+        case 6: return d.emergency ? 1.0 : 0.0;
+        case 7: return d.ackRequired ? 1.0 : 0.0;
+        case 8: return kmh(d.intervention);
+        case 9: { // code: ATS code index, TVM step km/h (RRR −1), ATP mode (0 FS, 1 SR, 2 TR)
+            switch (sim_.onboard->active().value_or(safety::System::Ats)) {
+            case safety::System::Ats: return double(sim_.onboard->atsCode());
+            case safety::System::Tvm430: return d.code == "RRR" ? -1.0 : d.code == "000" ? 0.0 : std::atof(d.code.c_str());
+            case safety::System::Atp: return d.code == "FS" ? 0.0 : d.code == "SR" ? 1.0 : 2.0;
+            }
+            return 0.0;
+        }
+        default: return 0.0;
+        }
+    }
     case Var::MainReservoir: return pressure(t.mainReservoir);
     case Var::EmergencyReservoir: return pressure(t.mainReservoir);
     case Var::BrakePipe: return pressure(t.brakePipe);
@@ -402,7 +497,7 @@ double ScriptContext::variable(Var v, int index) const {
     case Var::StraightAirPipe: return pressure(t.straightAirPipe);
     case Var::EqualizingReservoir: return pressure(t.brakePipe);
     case Var::Section:
-        if (section >= 0 && std::size_t(section) < sim_.sections.size()) return sim_.sections[std::size_t(section)].currentAspect;
+        if (section && *section < sim_.sections.size()) return sim_.sections[*section].currentAspect;
         return 0.0;
     case Var::Klaxon:
     case Var::PrimaryKlaxon: return t.hornPrimary ? 1.0 : 0.0;
@@ -414,12 +509,12 @@ double ScriptContext::variable(Var v, int index) const {
     case Var::Headlights: return t.headlights ? 1.0 : 0.0;
     case Var::WiperPosition: return 0.0;
     case Var::RouteLimit: return sim_.route.speedLimitAt(t.front);
-    case Var::NextStation: return sim_.nextStation;
-    case Var::NextStationStop: return sim_.nextStation;
+    case Var::NextStation:
+    case Var::NextStationStop: return sim_.nextStation ? double(*sim_.nextStation) : -1.0;
     case Var::TerminalStation: return double(sim_.route.stations.size()) - 1;
-    case Var::DistanceNextStation: return sim_.nextStation >= 0 ? sim_.distanceToStop(sim_.nextStation) : 0.0;
-    case Var::StopsNextStation: return sim_.nextStation >= 0 && sim_.route.stations[std::size_t(sim_.nextStation)].stopsHere() ? 1.0 : 0.0;
-    case Var::DistanceStation: return index >= 0 ? sim_.distanceToStop(index) : 0.0;
+    case Var::DistanceNextStation: return sim_.nextStation ? sim_.distanceToStop(*sim_.nextStation) : 0.0;
+    case Var::StopsNextStation: return sim_.nextStation && sim_.route.stations[*sim_.nextStation].stopsHere() ? 1.0 : 0.0;
+    case Var::DistanceStation: return index >= 0 && std::size_t(index) < sim_.route.stations.size() ? sim_.distanceToStop(std::size_t(index)) : 0.0;
     case Var::TimetableVisible: return 0.0;
     case Var::Brightness: return sim_.cabBrightness();
     case Var::PantographState: return 1.0;

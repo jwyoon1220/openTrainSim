@@ -1,4 +1,4 @@
-#include "audio/Wav.hpp"
+#include "phx/core/Wav.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -7,7 +7,7 @@
 #include <fstream>
 #include <limits>
 
-namespace ots {
+namespace phx {
 namespace {
 
 uint16_t read16(const uint8_t* p) {
@@ -133,4 +133,4 @@ bool loadWav(const std::filesystem::path& file, PcmMono16& out, std::string& err
     return decodeWav(bytes, out, error);
 }
 
-} // namespace ots
+} // namespace phx

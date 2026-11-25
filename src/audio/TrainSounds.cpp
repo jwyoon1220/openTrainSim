@@ -71,6 +71,7 @@ void TrainSounds::update(Simulation& sim, double dt) {
     updateMotor(sim);
     updateEvents(sim, dt);
     updatePlugin(sim);
+    updateSafety(sim);
     updateRoute(sim);
     first_ = false;
 }
@@ -121,6 +122,63 @@ void TrainSounds::updateRun(const Simulation& sim, double dt) {
     }
 }
 
+// Cab alarm of the built-in train protection: a pulsed beep while an overspeed warning
+// waits, a steady two-tone while the device brakes, a soft chime when it asks for an
+// acknowledgement (zone change, reset). Rendered on the audio update thread.
+struct TrainSounds::AlarmSynth {
+    enum class Pattern : u8 { Silent, Warning, Braking, Prompt };
+    Pattern pattern = Pattern::Silent;
+    int rate = 44100;
+    double t = 0.0, phase = 0.0, level = 0.0;
+    void render(std::span<int16_t> out) {
+        constexpr double tau = 6.283185307179586;
+        for (int16_t& s : out) {
+            double f = 0.0, on = 0.0;
+            switch (pattern) {
+            case Pattern::Silent: break;
+            case Pattern::Warning: f = 1250.0, on = std::fmod(t, 0.28) < 0.16 ? 1.0 : 0.0; break;
+            case Pattern::Braking: f = std::fmod(t, 0.5) < 0.25 ? 960.0 : 760.0, on = 1.0; break;
+            case Pattern::Prompt: f = std::fmod(t, 1.2) < 0.3 ? 880.0 : 660.0, on = std::fmod(t, 1.2) < 0.6 ? 0.6 : 0.0; break;
+            }
+            level += (on - level) * 0.004; // ~5 ms attack / release: no clicks
+            phase = std::fmod(phase + f / rate, 1.0);
+            const double v = std::sin(tau * phase) + 0.25 * std::sin(3.0 * tau * phase); // a little edge, like a buzzer
+            s = int16_t(std::lround(9000.0 * level * v));
+            t += 1.0 / rate;
+        }
+    }
+};
+
+void TrainSounds::updateSafety(const Simulation& sim) {
+    if (!sim.onboard) return;
+    if (!alarm_) {
+        alarm_ = std::make_shared<AlarmSynth>();
+        std::shared_ptr<AlarmSynth> synth = alarm_;
+        alarmStream_ = audio_.playStream(synth->rate, [synth](std::span<int16_t> out) { synth->render(out); }, {driverCar_, {-0.5, 1.8, 8.0}}, kSmall, 0.8);
+    }
+    const safety::Display& d = sim.onboard->display();
+    using P = AlarmSynth::Pattern;
+    const P want = d.braking ? P::Braking : d.warning ? P::Warning : d.ackRequired ? P::Prompt : P::Silent;
+    if (want != alarm_->pattern) alarm_->pattern = want, alarm_->t = 0.0;
+}
+
+void TrainSounds::setVvvf(const VvvfPreset& preset) {
+    if (vvvfStream_) audio_.stop(vvvfStream_), vvvfStream_ = 0;
+    constexpr int kRate = 44100;
+    vvvf_ = std::make_shared<VvvfSynth>(preset, kRate);
+    // the motor car nearest the driver's car
+    int car = driverCar_;
+    for (int d = 0; d < int(motorCar_.size()); ++d) {
+        if (driverCar_ - d >= 0 && motorCar_[std::size_t(driverCar_ - d)]) { car = driverCar_ - d; break; }
+        if (driverCar_ + d < int(motorCar_.size()) && motorCar_[std::size_t(driverCar_ + d)]) { car = driverCar_ + d; break; }
+    }
+    std::shared_ptr<VvvfSynth> synth = vvvf_;
+    vvvfStream_ = audio_.playStream(kRate, [synth](std::span<int16_t> out) { synth->render(out); }, {car, {0.0, 0.5, 0.0}},
+                                    preset.radius, 1.0);
+    phx::log::info("sound: VVVF \"{}\" on car {} ({} power / {} brake stages{})", preset.name, car, preset.power.size(),
+                   preset.brake.size(), preset.replaceMotor ? ", replaces the motor sound" : "");
+}
+
 // openBVE BVEMotorSound.Update (train.dat motor sound tables, 18 rows per m/s)
 void TrainSounds::updateMotor(const Simulation& sim) {
     const TrainSim& t = *sim.train;
@@ -136,6 +194,8 @@ void TrainSounds::updateMotor(const Simulation& sim) {
         ndir = -1;
         ratio = t.brakeCylinder / std::max(1.0, spec.bcServiceMax);
     }
+    if (vvvf_) vvvf_->set(t.speed, ndir, std::clamp(ratio, 0.0, 1.0));
+    if (vvvf_ && vvvf_->preset().replaceMotor) return;
     ratio = std::pow(std::clamp(ratio, 0.0, 1.0), 0.25);
     for (std::size_t c = 0; c < cars_.size(); ++c) {
         if (!motorCar_[c]) continue;
@@ -152,7 +212,7 @@ void TrainSounds::updateMotor(const Simulation& sim) {
             const auto& entries = spec.motorSound[std::size_t(table)];
             if (entries.empty()) continue;
             const MotorSoundEntry& e = entries[std::size_t(std::min(idx, int(entries.size()) - 1))];
-            auto it = e.sound >= 0 ? motor_.find(e.sound) : motor_.end();
+            auto it = e.sound ? motor_.find(*e.sound) : motor_.end();
             const SoundBufferId nb = it != motor_.end() ? it->second : -1;
             const double gain = double(e.gain) * ratio;
             if (nb != tr.buffer) {
@@ -312,10 +372,10 @@ void TrainSounds::updatePlugin(Simulation& sim) {
                 pl.soundEnded(cmd.handle);
                 break;
             }
-            const int car = cmd.car >= 0 && cmd.car < int(cars_.size()) ? cmd.car : driverCar_;
-            const glm::dvec3 at = cmd.car < 0 ? panel_ : glm::dvec3(0.0);
-            const double radius = cmd.car < 0 ? kTiny : kMedium;
-            const auto slot = std::make_pair(cmd.car, cmd.index);
+            const int car = cmd.car && *cmd.car < int(cars_.size()) ? *cmd.car : driverCar_;
+            const glm::dvec3 at = cmd.car ? glm::dvec3(0.0) : panel_;
+            const double radius = cmd.car ? kMedium : kTiny;
+            const auto slot = std::make_pair(cmd.car.value_or(-1), cmd.index);
             SoundId id = 0;
             if (cmd.looped) {
                 auto s = pluginSlots_.find(slot);
@@ -388,9 +448,9 @@ void TrainSounds::updateRoute(const Simulation& sim) {
             arrivedSeen[i] = 1;
             if (!first_ && !st.arrivalSound.empty()) playAt(buf(st.arrivalSound), driverCar_, {0, 0, 0}, 30.0);
         }
-        if (!st.departureSound.empty() && pr.arrived && !pr.departed && !departurePlayed_[i] && st.departure >= 0.0) {
+        if (!st.departureSound.empty() && pr.arrived && !pr.departed && !departurePlayed_[i] && st.departure) {
             const SoundBufferId b = buf(st.departureSound);
-            if (sim.time >= st.departure - audio_.duration(b)) {
+            if (sim.time >= *st.departure - audio_.duration(b)) {
                 departurePlayed_[i] = 1;
                 playAt(b, driverCar_, {0, 0, 0}, 30.0);
             }

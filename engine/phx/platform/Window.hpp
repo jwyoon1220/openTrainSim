@@ -53,12 +53,23 @@ public:
     void setCursorCaptured(bool on);
     [[nodiscard]] bool cursorCaptured() const { return captured_; }
 
+    // Borderless fullscreen on the monitor the window is on (video mode unchanged); toggling
+    // back restores the previous window position and size.
+    void setFullscreen(bool on);
+    [[nodiscard]] bool fullscreen() const { return fullscreen_; }
+    // Refresh rate (Hz) of the monitor showing the window (primary where the position is
+    // unknown, e.g. on Wayland); 0 if unknown.
+    [[nodiscard]] int refreshRate() const;
+    void maximize();
+
 private:
     GLFWwindow* window_ = nullptr;
     InputFrame pending_;
     f64 lastX_ = 0, lastY_ = 0;
     bool dragging_ = false;
     bool captured_ = false;
+    bool fullscreen_ = false;
+    int savedX_ = 0, savedY_ = 0, savedW_ = 0, savedH_ = 0;
     [[nodiscard]] InputEvent cursorEvent(InputEvent::Type t, f64 x, f64 y) const; // window → framebuffer px
 };
 

@@ -7,6 +7,7 @@ layout(location = 2) in vec3 vView;
 layout(location = 3) in float vBrightness;
 layout(location = 4) in vec4 vCur;
 layout(location = 5) in vec4 vPrev;
+layout(location = 6) flat in float vRepeat;
 layout(location = 0) out vec4 outColor;
 layout(location = 1) out vec2 outMotion; // masked off in the blend pass / absent with MSAA
 
@@ -17,14 +18,31 @@ void main() {
     Frame fr = FrameRef(pc.frame).f;
     Material m = MaterialRef(pc.materials).m[pc.material];
     vec4 c = unpackUnorm4x8(m.color);
-    if ((m.flags & MAT_TEXTURED) != 0u) c *= texture(gTextures[nonuniformEXT(m.texture)], vUv, fr.misc.w);
+    if ((m.flags & MAT_TEXTURED) != 0u) {
+        if (vRepeat > 0.5) { // texture shift: repeat whatever the sampler (gradients of the continuous UV: no seam)
+            float bias = exp2(fr.misc.w);
+            c *= textureGrad(gTextures[nonuniformEXT(m.texture)], fract(vUv), dFdx(vUv) * bias, dFdy(vUv) * bias);
+        } else {
+            c *= texture(gTextures[nonuniformEXT(m.texture)], vUv, fr.misc.w);
+        }
+    }
 
-    // openBVE lighting: colour × min(ambient + diffuse·max(N·L, 0), 1) + emissive
+    // openBVE lighting: colour × min(ambient + diffuse·max(N·L, 0), 1) + emissive, with
+    //  - sun shadows on the diffuse term
+    //  - a hemisphere ambient (sky above, ground below; same average) for shape
+    //  - a faint sun highlight (no material data: kept weak)
     vec3 n = normalize(vNormal);
     if (!gl_FrontFacing) n = -n;
-    float lambert = max(dot(n, fr.lightDir.xyz), 0.0);
-    vec3 light = min(fr.ambient.rgb + fr.diffuse.rgb * lambert, vec3(1.0)) * vBrightness;
+    float ndl = max(dot(n, fr.lightDir.xyz), 0.0);
+    float shadow = ndl > 0.0 ? sunShadow(fr, vView, n, ndl) : 1.0;
+    float lambert = ndl * shadow;
+    vec3 ambient = fr.ambient.rgb * mix(1.0, 0.82 + 0.33 * (n.y * 0.5 + 0.5), fr.lighting.x);
+    vec3 light = min(ambient + fr.diffuse.rgb * lambert, vec3(1.0)) * vBrightness;
     vec3 rgb = c.rgb * light + unpackUnorm4x8(m.emissive).rgb;
+    if (fr.lighting.y > 0.0 && lambert > 0.0) {
+        vec3 h = normalize(fr.lightDir.xyz - normalize(vView));
+        rgb += fr.diffuse.rgb * (fr.lighting.y * lambert * pow(max(dot(n, h), 0.0), 40.0) * vBrightness);
+    }
 
     float dist = length(vView);
     if ((m.flags & MAT_ADDITIVE) != 0u) {

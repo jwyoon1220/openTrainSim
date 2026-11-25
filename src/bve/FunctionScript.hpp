@@ -23,7 +23,7 @@ enum class Var : unsigned short {
     Section, Klaxon, PrimaryKlaxon, SecondaryKlaxon, MusicKlaxon, PassAlarm, PilotLamp, StationAdjustAlarm,
     Headlights, WiperPosition, RouteLimit, NextStation, NextStationStop, TerminalStation, DistanceNextStation,
     StopsNextStation, DistanceStation, TimetableVisible, Brightness, FrontAxleCurveRadius, RearAxleCurveRadius,
-    PantographState, MainBreaker, Count
+    PantographState, MainBreaker, Safety, Count
 };
 
 class FunctionContext {

@@ -1,6 +1,7 @@
 #include "phx/ui/Ui.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 
@@ -237,11 +238,12 @@ void Button::fire() {
 }
 void Button::paint(Painter &p) {
     const Theme &t = p.theme();
-    p.fillRect(bounds(), !enabled() ? t.controlPressed
-                         : pressed_ ? t.controlPressed
-                         : hover_   ? t.controlHover
-                                    : t.control);
-    p.drawBorder(bounds(), focused() ? t.accent : t.border, focused() ? 2 : 1);
+    p.fillRoundedRect(bounds(), t.cornerRadius,
+                      !enabled() ? t.controlPressed
+                      : pressed_ ? t.controlPressed
+                      : hover_   ? t.controlHover
+                                 : t.control);
+    p.strokeRoundedRect(bounds(), t.cornerRadius, focused() ? 2.0f : 1.0f, focused() ? t.accent : t.border);
     const f32 w = p.textWidth(text_);
     p.drawText(bounds().x + (bounds().w - w) / 2, bounds().y + (bounds().h - p.lineHeight()) / 2, text_,
                enabled() ? t.text : t.disabledText);
@@ -282,13 +284,16 @@ void CheckBox::onKey(Key k, bool down, bool, bool) {
 void CheckBox::paint(Painter &p) {
     const f32 boxSize = std::max(1.0f, bounds().h - p.theme().padding * 1.5f);
     Rect box{bounds().x + p.theme().padding / 2, bounds().y + (bounds().h - boxSize) / 2, boxSize, boxSize};
-    p.fillRect(box, p.theme().control);
-    p.drawBorder(box, focused() ? p.theme().accent : p.theme().border);
+    const f32 r = std::min(p.theme().cornerRadius, box.w * 0.25f);
     if (selected_) {
-        p.fillRect({box.x + 3, box.y + 7, 3, 5}, p.theme().accent);
-        p.fillRect({box.x + 6, box.y + 9, 3, 3}, p.theme().accent);
-        p.fillRect({box.x + 9, box.y + 4, 3, 7}, p.theme().accent);
+        p.fillRoundedRect(box, r, p.theme().accent);
+        const std::array<Point, 3> tick{Point{box.x + box.w * 0.24f, box.y + box.h * 0.52f}, Point{box.x + box.w * 0.43f, box.y + box.h * 0.72f},
+                                        Point{box.x + box.w * 0.78f, box.y + box.h * 0.30f}};
+        p.strokePolyline(tick, std::max(1.5f, box.w * 0.13f), p.theme().text);
+    } else {
+        p.fillRoundedRect(box, r, p.theme().control);
     }
+    p.strokeRoundedRect(box, r, 1.0f, focused() ? p.theme().accent : p.theme().border);
     p.drawText(box.x + box.w + p.theme().padding / 2, bounds().y + (bounds().h - p.lineHeight()) / 2, text_,
                enabled() ? p.theme().text : p.theme().disabledText);
 }
@@ -379,11 +384,12 @@ void Slider::paint(Painter &p) {
     const f32 extra = valueWidth(), span = std::max(1.0f, bounds().w - 20 - extra);
     const f32 t = maximum_ == minimum_ ? 0 : (value_ - minimum_) / (maximum_ - minimum_);
     Rect track{bounds().x + 10, bounds().y + bounds().h / 2 - 2, span, 4};
-    p.fillRect(track, p.theme().controlPressed);
-    p.fillRect({track.x, track.y, span * t, 4}, p.theme().accent);
-    Rect thumb{track.x + span * t - 5, bounds().y + 5, 10, bounds().h - 10};
-    p.fillRect(thumb, p.theme().controlHover);
-    p.drawBorder(thumb, focused() ? p.theme().accent : p.theme().border);
+    p.fillRoundedRect(track, 2.0f, p.theme().controlPressed);
+    p.fillRoundedRect({track.x, track.y, span * t, 4}, 2.0f, p.theme().accent);
+    const Point centre{track.x + span * t, bounds().y + bounds().h / 2};
+    const f32 radius = std::max(4.0f, bounds().h / 2 - 5);
+    p.fillCircle(centre, radius, p.theme().controlHover);
+    p.strokeCircle(centre, radius - 0.5f, focused() ? 2.0f : 1.0f, focused() ? p.theme().accent : p.theme().border);
     if (formatter_)
         p.drawText(bounds().x + bounds().w - extra + 4, bounds().y + (bounds().h - p.lineHeight()) / 2,
                    formatter_(value_), p.theme().text);
@@ -446,13 +452,13 @@ void ComboBox::onKey(Key k, bool down, bool, bool) {
         onMouseWheel(1);
 }
 void ComboBox::paint(Painter &p) {
-    p.fillRect(bounds(), p.theme().control);
-    p.drawBorder(bounds(), focused() ? p.theme().accent : p.theme().border);
+    p.fillRoundedRect(bounds(), p.theme().cornerRadius, p.theme().control);
+    p.strokeRoundedRect(bounds(), p.theme().cornerRadius, 1.0f, focused() ? p.theme().accent : p.theme().border);
     if (selected_ >= 0)
         p.drawText(bounds().x + p.theme().padding, bounds().y + (bounds().h - p.lineHeight()) / 2, items_[selected_],
                    enabled() ? p.theme().text : p.theme().disabledText);
-    for (int row = 0; row < 5; ++row)
-        p.fillRect({bounds().x + bounds().w - 16 + row, bounds().y + 10 + row, 9 - row * 2.0f, 1}, p.theme().text);
+    const f32 ax = bounds().x + bounds().w - 12, ay = bounds().y + bounds().h / 2; // drop-down arrow
+    p.fillTriangle({ax - 5, ay - 2.5f}, {ax + 5, ay - 2.5f}, {ax, ay + 3.5f}, p.theme().text);
 }
 
 TextField::TextField(std::string t, u32 c) : text_(std::move(t)), columns_(c), caret_(static_cast<u32>(text_.size())) {
@@ -515,8 +521,8 @@ void TextField::onChar(u32 c) {
     }
 }
 void TextField::paint(Painter &p) {
-    p.fillRect(bounds(), p.theme().controlPressed);
-    p.drawBorder(bounds(), focused() ? p.theme().accent : p.theme().border);
+    p.fillRoundedRect(bounds(), p.theme().cornerRadius, p.theme().controlPressed);
+    p.strokeRoundedRect(bounds(), p.theme().cornerRadius, focused() ? 2.0f : 1.0f, focused() ? p.theme().accent : p.theme().border);
     const f32 textX = bounds().x + p.theme().padding;
     p.drawText(textX, bounds().y + (bounds().h - p.lineHeight()) / 2, text_, p.theme().text);
     if (focused()) {
@@ -570,7 +576,7 @@ void ScrollPane::paint(Painter &p) {
     if (!children().empty()) {
         const f32 full = std::max(bounds().h, children().front()->preferredSize().h);
         const f32 thumb = bounds().h * bounds().h / full;
-        p.fillRect({bounds().x + bounds().w - 7, bounds().y + offset_ / full * bounds().h, 5, thumb}, p.theme().border);
+        p.fillRoundedRect({bounds().x + bounds().w - 7, bounds().y + offset_ / full * bounds().h, 5, thumb}, 2.5f, p.theme().border);
     }
 }
 
@@ -639,8 +645,10 @@ void TabbedPane::paint(Painter &p) {
     for (std::size_t index = 0; index < titles_.size(); ++index) {
         const f32 width = tabWidth(index);
         Rect tab{tabX, bounds().y, width, p.theme().rowHeight};
-        p.fillRect(tab, static_cast<int>(index) == selected_ ? p.theme().controlHover : p.theme().control);
-        p.drawBorder(tab, p.theme().border);
+        const bool active = static_cast<int>(index) == selected_;
+        const Rect pill{tab.x + 2, tab.y + 2, tab.w - 4, tab.h - 4};
+        p.fillRoundedRect(pill, p.theme().cornerRadius, active ? p.theme().controlHover : p.theme().control);
+        if (active) p.fillRoundedRect({pill.x + 6, pill.y + pill.h - 3, pill.w - 12, 3}, 1.5f, p.theme().accent);
         p.drawText(tab.x + p.theme().padding, tab.y + (tab.h - p.lineHeight()) / 2, titles_[index], p.theme().text);
         tabX += width;
     }
@@ -724,18 +732,30 @@ void Window::onMouseRelease(MouseButton, f32, f32) {
     dragging_ = false;
 }
 void Window::paint(Painter &p) {
-    p.fillRect(bounds(), p.theme().window);
-    p.fillRect({bounds().x, bounds().y, bounds().w, p.theme().titleHeight}, p.theme().control);
-    p.drawBorder(bounds(), p.theme().border);
+    const Theme &t = p.theme();
+    const f32 r = t.cornerRadius * 1.5f;
+    const Rect b = bounds();
+    p.pushClip({b.x - 16, b.y - 16, b.w + 32, b.h + 32}); // the shadow reaches outside the window
+    for (int k = 3; k >= 1; --k) // soft drop shadow: a few widening, fading layers
+        p.fillRoundedRect({b.x - f32(k) * 2 + 3, b.y - f32(k) * 2 + 5, b.w + f32(k) * 4, b.h + f32(k) * 4}, r + f32(k) * 2,
+                          (t.shadow & 0x00FFFFFFu) | (((t.shadow >> 24u) / u32(k + 1)) << 24u));
+    p.popClip();
+    p.fillRoundedRect(b, r, t.window);
+    p.pushClip({b.x, b.y, b.w, t.titleHeight}); // title bar: the window's top, rounded
+    p.fillRoundedRect(b, r, t.control);
+    p.popClip();
+    p.strokeRoundedRect(b, r, 1.0f, t.border);
     p.drawText(bounds().x + p.theme().padding, bounds().y + (p.theme().titleHeight - p.lineHeight()) / 2, title_,
                p.theme().text);
     if (closable_) {
         const f32 size = p.theme().titleHeight - p.theme().padding;
         Rect close{bounds().x + bounds().w - size - p.theme().padding / 2, bounds().y + p.theme().padding / 2, size,
                    size};
-        p.fillRect(close, p.theme().controlHover);
-        p.drawText(close.x + (close.w - p.textWidth("x")) / 2, close.y + (close.h - p.lineHeight()) / 2, "x",
-                   p.theme().text);
+        const Point c{close.x + close.w / 2, close.y + close.h / 2};
+        p.fillCircle(c, close.w / 2, p.theme().controlHover);
+        const f32 k = close.w * 0.2f;
+        p.drawLine({c.x - k, c.y - k}, {c.x + k, c.y + k}, 1.6f, p.theme().text);
+        p.drawLine({c.x - k, c.y + k}, {c.x + k, c.y - k}, 1.6f, p.theme().text);
     }
 }
 } // namespace phx::ui

@@ -1,0 +1,6 @@
+// 느린 선행 열차(최고 15 km/h): 따라잡으면 정지 현시를 만납니다 (ots_check --safety ... redpass)
+{
+  "trains": [
+    { "name": "느린 선행", "departure": "08:58:00", "train": "../trains/test-emu", "maxSpeed": 15 }
+  ]
+}

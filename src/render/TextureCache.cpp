@@ -5,6 +5,7 @@
 
 #include <stb_image.h>
 
+#include <algorithm>
 #include <cstring>
 #include <format>
 
@@ -30,11 +31,12 @@ void TextureCache::destroy(Entry& e) {
     e.state = State::Free;
 }
 
-TextureId TextureCache::acquire(const std::string& path, bool colorKey, u8 r, u8 g, u8 b) {
+TextureId TextureCache::acquire(const std::string& path, bool colorKey, u8 r, u8 g, u8 b, JobPriority priority) {
     const std::string key = colorKey ? std::format("{}|{},{},{}", path, r, g, b) : path;
     auto it = index_.find(key);
     if (it != index_.end()) {
         ++entries_[it->second].refs;
+        prioritize(it->second, priority);
         return it->second;
     }
     TextureId id;
@@ -55,10 +57,11 @@ TextureId TextureCache::acquire(const std::string& path, bool colorKey, u8 r, u8
     e.r = r, e.g = g, e.b = b;
     e.refs = 1;
     e.state = State::Decoding;
+    e.priority = priority;
     index_.emplace(key, id);
     ++pendingCount_;
     const TextureSettings s = settings_;
-    pool_.submit([this, id, gen, path, colorKey, r, g, b, s] {
+    e.job = pool_.submit([this, id, gen, path, colorKey, r, g, b, s] {
         Done d{id, gen, false, {}, 0};
         int w = 0, h = 0, n = 0;
         unsigned char* px = stbi_load(path.c_str(), &w, &h, &n, 4);
@@ -84,8 +87,16 @@ TextureId TextureCache::acquire(const std::string& path, bool colorKey, u8 r, u8
         }
         std::lock_guard lock(doneMutex_);
         done_.push_back(std::move(d));
-    });
+    }, priority);
     return id;
+}
+
+void TextureCache::prioritize(TextureId id, JobPriority priority) {
+    if (id == kNone || id >= entries_.size()) return;
+    Entry& e = entries_[id];
+    if (e.state != State::Decoding || !(priority < e.priority)) return;
+    e.priority = priority;
+    pool_.raise(e.job, priority);
 }
 
 void TextureCache::release(TextureId id) {
@@ -101,6 +112,8 @@ void TextureCache::update() {
         for (Done& d : done_) waiting_.push_back(std::move(d));
         done_.clear();
     }
+    // most urgent first: the upload budget goes to what is visible
+    std::ranges::stable_sort(waiting_, {}, [&](const Done& d) { return entries_[d.id].priority; });
     std::size_t keep = 0;
     for (std::size_t i = 0; i < waiting_.size(); ++i) {
         Done& d = waiting_[i];
@@ -109,6 +122,7 @@ void TextureCache::update() {
         if (!d.ok) {
             phx::log::warn("Texture unreadable: {}", e.path);
             e.state = State::Failed;
+            e.job = {};
             --pendingCount_;
             continue;
         }
@@ -127,6 +141,7 @@ void TextureCache::update() {
         e.bytes = d.tex.data.size();
         e.raw = d.raw;
         e.state = State::Resident;
+        e.job = {};
         residentBytes_ += e.bytes;
         rawBytes_ += e.raw;
         ++residentCount_;
@@ -139,7 +154,11 @@ void TextureCache::update() {
     for (TextureId id : zeroRef_) {
         Entry& e = entries_[id];
         if (e.refs != 0 || e.state == State::Free) continue; // re-acquired meanwhile
-        if (e.state == State::Decoding) --pendingCount_;    // its result will be stale
+        if (e.state == State::Decoding) {
+            --pendingCount_; // its result will be stale
+            pool_.cancel(e.job);
+        }
+        e.job = {};
         index_.erase(e.key);
         if (e.slotRepeat) bindless_.freeSampled(e.slotRepeat);
         if (e.slotClamp) bindless_.freeSampled(e.slotClamp);
@@ -165,6 +184,10 @@ void TextureCache::update() {
     }
 }
 
+std::size_t TextureCache::pendingCount(JobPriority upTo) const {
+    return std::size_t(std::ranges::count_if(entries_, [&](const Entry& e) { return e.state == State::Decoding && e.priority <= upTo; }));
+}
+
 bool TextureCache::settled(TextureId id) const {
     if (id == kNone) return true;
     const State s = entries_[id].state;
@@ -186,12 +209,13 @@ u32 TextureCache::slot(TextureId id, bool clamp) {
 
 // ------------------------------------------------------------------ materials
 
-MaterialId MaterialTable::acquire(const Material& m) {
+MaterialId MaterialTable::acquire(const Material& m, JobPriority priority) {
     const std::string key = std::format("{}|{:08x}|{:06x}|{}{}{}{}|{}|{}|{}", m.texture, m.color, m.emissive, int(m.colorKey), int(m.keyR),
                                         int(m.keyG), int(m.keyB), int(m.blend), int(m.wrap), m.glowHalfDistance);
     auto it = index_.find(key);
     if (it != index_.end()) {
         ++entries_[it->second].refs;
+        textures_.prioritize(entries_[it->second].texture, priority);
         return it->second;
     }
     MaterialId id;
@@ -205,7 +229,7 @@ MaterialId MaterialTable::acquire(const Material& m) {
     Entry& e = entries_[id];
     e.m = m;
     e.refs = 1;
-    e.texture = m.texture.empty() ? kNone : textures_.acquire(m.texture, m.colorKey, m.keyR, m.keyG, m.keyB);
+    e.texture = m.texture.empty() ? kNone : textures_.acquire(m.texture, m.colorKey, m.keyR, m.keyG, m.keyB, priority);
     index_.emplace(key, id);
     return id;
 }

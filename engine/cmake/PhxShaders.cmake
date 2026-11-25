@@ -7,7 +7,7 @@
 # Compiles GLSL to SPIR-V into PHX_SHADER_OUTPUT_DIR[/PREFIX] (what phx::loadSpirv reads by
 # default) and creates a custom target that builds them. Games include engine headers as
 # "phx/bindless.glsl" etc.
-find_program(GLSLC glslc REQUIRED)
+find_program(GLSLC glslc HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin" REQUIRED) # Vulkan SDK / shaderc
 
 set(PHX_SHADER_OUTPUT_DIR "${CMAKE_BINARY_DIR}/shaders" CACHE PATH "Where compiled SPIR-V is written (engine + game)")
 
@@ -45,6 +45,17 @@ function(phx_engine_executable target)
     if (runtime)
         add_custom_command(TARGET ${target} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${runtime} $<TARGET_FILE_DIR:${target}>
+            VERBATIM)
+    endif ()
+endfunction()
+
+# phx_audio_executable(<target>): links phx::audio and copies a built-from-source OpenAL library
+# (Windows: OpenAL32.dll) next to the executable.
+function(phx_audio_executable target)
+    target_link_libraries(${target} PRIVATE phx::audio)
+    if (TARGET OpenAL)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different $<TARGET_FILE:OpenAL> $<TARGET_FILE_DIR:${target}>
             VERBATIM)
     endif ()
 endfunction()

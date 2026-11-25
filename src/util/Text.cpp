@@ -1,7 +1,19 @@
 #include "util/Text.hpp"
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
 #include <iconv.h>
+#endif
 
+#include <array>
+#include <algorithm>
 #include <cerrno>
 #include <charconv>
 #include <cmath>
@@ -42,8 +54,48 @@ bool isValidUtf8(std::string_view s) {
     return true;
 }
 
-std::string toUtf8(std::string_view bytes, const char* codepage) {
-    iconv_t cd = iconv_open("UTF-8", codepage);
+#ifdef _WIN32
+namespace {
+// iconv-style code page names (as written in the config) to Windows code page numbers.
+unsigned windowsCodepage(std::string_view name) {
+    std::string n;
+    for (char c : name)
+        if (c != '-' && c != '_' && c != ' ') n += c >= 'a' && c <= 'z' ? char(c - 'a' + 'A') : c;
+    struct Named { std::string_view name; unsigned cp; };
+    static constexpr auto table = std::to_array<Named>({
+        {"UTF8", 65001},     {"SHIFTJIS", 932},  {"SJIS", 932},     {"MS932", 932},       {"EUCKR", 949},
+        {"UHC", 949},        {"MS949", 949},     {"GBK", 936},      {"GB2312", 936},      {"GB18030", 54936},
+        {"BIG5", 950},       {"EUCJP", 20932},   {"LATIN1", 28591}, {"ISO88591", 28591},  {"ASCII", 20127},
+        {"KOI8R", 20866},    {"UTF16LE", 1200},  {"UTF16BE", 1201},
+    });
+    for (const Named& t : table)
+        if (n == t.name) return t.cp;
+    for (std::string_view prefix : {"WINDOWS", "CP", "IBM"}) {
+        if (!n.starts_with(prefix)) continue;
+        unsigned cp = 0;
+        const char* b = n.data() + prefix.size();
+        const auto r = std::from_chars(b, n.data() + n.size(), cp);
+        if (r.ec == std::errc() && r.ptr == n.data() + n.size()) return cp;
+    }
+    return 0;
+}
+} // namespace
+
+std::string toUtf8(std::string_view bytes, std::string_view codepage) {
+    const unsigned cp = windowsCodepage(codepage);
+    if (cp == 0 || cp == 65001 || bytes.empty() || bytes.size() > 0x7FFFFFFF) return std::string(bytes);
+    const int n = MultiByteToWideChar(cp, 0, bytes.data(), int(bytes.size()), nullptr, 0);
+    if (n <= 0) return std::string(bytes);
+    std::wstring w(std::size_t(n), L'\0');
+    MultiByteToWideChar(cp, 0, bytes.data(), int(bytes.size()), w.data(), n);
+    const int m = WideCharToMultiByte(CP_UTF8, 0, w.data(), n, nullptr, 0, nullptr, nullptr);
+    std::string out(std::size_t(std::max(m, 0)), '\0');
+    if (m > 0) WideCharToMultiByte(CP_UTF8, 0, w.data(), n, out.data(), m, nullptr, nullptr);
+    return out;
+}
+#else
+std::string toUtf8(std::string_view bytes, std::string_view codepage) {
+    iconv_t cd = iconv_open("UTF-8", std::string(codepage).c_str());
     if (cd == iconv_t(-1)) return std::string(bytes);
     std::string out;
     out.resize(bytes.size() * 3 + 16);
@@ -76,30 +128,24 @@ std::string toUtf8(std::string_view bytes, const char* codepage) {
     iconv_close(cd);
     return out;
 }
+#endif
 
-bool readTextFile(const std::filesystem::path& path, std::string& out, const char* fallbackCodepage) {
+std::optional<std::string> readTextFile(const std::filesystem::path& path, std::string_view fallbackCodepage) {
     std::ifstream f(path, std::ios::binary);
-    if (!f) return false;
+    if (!f) return std::nullopt;
     std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
-    const auto* b = reinterpret_cast<const unsigned char*>(bytes.data());
-    if (bytes.size() >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF) {
-        out = bytes.substr(3);
-    } else if (bytes.size() >= 2 && b[0] == 0xFF && b[1] == 0xFE) {
-        out = toUtf8(std::string_view(bytes).substr(2), "UTF-16LE");
-    } else if (bytes.size() >= 2 && b[0] == 0xFE && b[1] == 0xFF) {
-        out = toUtf8(std::string_view(bytes).substr(2), "UTF-16BE");
-    } else if (isValidUtf8(bytes)) {
-        out = std::move(bytes);
-    } else {
-        std::string cp;
-        if (fallbackCodepage) cp = fallbackCodepage;
-        else {
-            std::lock_guard lock(gCodepageMutex);
-            cp = gDefaultCodepage;
-        }
-        out = toUtf8(bytes, cp.c_str());
+    const std::string_view v(bytes);
+    if (v.starts_with("\xEF\xBB\xBF")) return bytes.substr(3);
+    if (v.starts_with("\xFF\xFE")) return toUtf8(v.substr(2), "UTF-16LE");
+    if (v.starts_with("\xFE\xFF")) return toUtf8(v.substr(2), "UTF-16BE");
+    if (isValidUtf8(bytes)) return bytes;
+    if (!fallbackCodepage.empty()) return toUtf8(bytes, fallbackCodepage);
+    std::string codepage;
+    {
+        std::lock_guard lock(gCodepageMutex);
+        codepage = gDefaultCodepage;
     }
-    return true;
+    return toUtf8(bytes, codepage);
 }
 
 std::vector<std::string> splitLines(std::string_view text) {
@@ -157,70 +203,59 @@ std::size_t ifind(std::string_view s, std::string_view needle, std::size_t from)
 }
 
 namespace {
-// Parses a decimal number occupying exactly `s` (no spaces), allowing a leading '+' and a
-// leading '.' (".5"). Uses from_chars (locale independent).
-bool parseExact(std::string_view s, double& out) {
-    if (s.empty()) return false;
-    std::string tmp;
-    if (s.front() == '+') s.remove_prefix(1);
-    if (s.empty()) return false;
+// A decimal number occupying exactly `s` (no spaces), allowing a leading '+' and a leading
+// '.' (".5"). Uses from_chars (locale independent).
+std::optional<double> parseExact(std::string_view s) {
+    if (s.starts_with('+')) s.remove_prefix(1);
+    if (s.empty()) return std::nullopt;
     // from_chars rejects ".5" / "-.5" in some libstdc++ versions: normalise.
-    if (s.front() == '.' || (s.size() > 1 && s[0] == '-' && s[1] == '.')) {
-        tmp = s.front() == '-' ? "-0" + std::string(s.substr(1)) : "0" + std::string(s);
-        s = tmp;
+    std::string normalised;
+    if (s.front() == '.' || s.starts_with("-.")) {
+        normalised = s.front() == '-' ? "-0" + std::string(s.substr(1)) : "0" + std::string(s);
+        s = normalised;
     }
-    const char* end = s.data() + s.size();
-    auto [p, ec] = std::from_chars(s.data(), end, out, std::chars_format::general);
-    return ec == std::errc() && p == end && std::isfinite(out);
+    double v = 0.0;
+    const auto [end, ec] = std::from_chars(s.data(), s.data() + s.size(), v, std::chars_format::general);
+    if (ec != std::errc() || end != s.data() + s.size() || !std::isfinite(v)) return std::nullopt;
+    return v;
 }
 } // namespace
 
-bool parseDouble(std::string_view s, double& out) {
-    s = trim(s);
-    return parseExact(s, out);
-}
+std::optional<double> parseDouble(std::string_view s) { return parseExact(trim(s)); }
 
-bool parseDoubleVb6(std::string_view s, double& out) {
-    s = trim(s);
-    // remove embedded whitespace (VB6 Val() semantics)
+std::optional<double> parseDoubleVb6(std::string_view s) {
+    // VB6 Val(): embedded whitespace is ignored, then the longest numeric prefix counts
     std::string compact;
-    compact.reserve(s.size());
-    for (char c : s)
-        if (!isSpace(c)) compact.push_back(c);
+    std::ranges::copy_if(trim(s), std::back_inserter(compact), [](char c) { return !isSpace(c); });
     for (std::size_t n = compact.size(); n > 0; --n)
-        if (parseExact(std::string_view(compact).substr(0, n), out)) return true;
-    return false;
+        if (const auto v = parseExact(std::string_view(compact).substr(0, n))) return v;
+    return std::nullopt;
 }
 
-bool parseIntVb6(std::string_view s, int& out) {
-    double d;
-    if (!parseDoubleVb6(s, d)) return false;
-    if (d < -2147483648.0 || d > 2147483647.0) return false;
-    out = int(std::round(d));
-    return true;
+std::optional<int> parseIntVb6(std::string_view s) {
+    const auto d = parseDoubleVb6(s);
+    if (!d || *d < -2147483648.0 || *d > 2147483647.0) return std::nullopt;
+    return int(std::round(*d));
 }
 
-bool parseLength(std::string_view s, const std::vector<double>& unitFactors, double& out) {
+std::optional<double> parseLength(std::string_view s, std::span<const double> unitFactors) {
     s = trim(s);
     if (s.find(':') == std::string_view::npos) {
-        double v;
-        if (!parseExact(s, v)) return false;
-        out = v * (unitFactors.empty() ? 1.0 : unitFactors.back());
-        return true;
+        const auto v = parseExact(s);
+        if (!v) return std::nullopt;
+        return *v * (unitFactors.empty() ? 1.0 : unitFactors.back());
     }
+    // "a:b:c": the last part uses the last factor, the one before the factor before it ...
     const auto parts = split(s, ':');
     double total = 0.0;
     for (std::size_t i = 0; i < parts.size(); ++i) {
         const std::string_view p = trim(parts[i]);
         if (p.empty()) continue;
-        double v;
-        if (!parseExact(p, v)) return false;
-        const std::size_t fi = unitFactors.size() - parts.size() + i;
-        const double f = (unitFactors.size() >= parts.size()) ? unitFactors[fi] : 1.0;
-        total += v * f;
+        const auto v = parseExact(p);
+        if (!v) return std::nullopt;
+        total += *v * (unitFactors.size() >= parts.size() ? unitFactors[unitFactors.size() - parts.size() + i] : 1.0);
     }
-    out = total;
-    return true;
+    return total;
 }
 
 std::string asciiOnly(std::string_view utf8) {

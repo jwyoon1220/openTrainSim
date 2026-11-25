@@ -11,6 +11,15 @@
 #include <format>
 
 #ifdef PHX_HAS_DLSS
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
 #include <nvsdk_ngx_helpers_vk.h>
 #include <nvsdk_ngx_defs_dlssg.h>
 #include <nvsdk_ngx_helpers_dlssg_vk.h>
@@ -125,7 +134,14 @@ bool optimalRenderSize(NVSDK_NGX_Parameter* p, VkExtent2D display, NVSDK_NGX_Per
 
 std::wstring executableDir() {
     std::error_code ec;
+#ifdef _WIN32
+    wchar_t buf[32768];
+    const DWORD n = GetModuleFileNameW(nullptr, buf, DWORD(std::size(buf)));
+    if (n == 0 || n >= std::size(buf)) ec = std::make_error_code(std::errc::no_such_file_or_directory);
+    const std::filesystem::path exe = ec ? std::filesystem::path() : std::filesystem::path(std::wstring(buf, n));
+#else
     const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+#endif
     return (ec ? std::filesystem::current_path() : exe.parent_path()).wstring();
 }
 } // namespace

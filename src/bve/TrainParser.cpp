@@ -37,10 +37,7 @@ namespace {
 
 std::vector<double> numbers(std::string_view line) {
     std::vector<double> out;
-    for (std::string_view p : split(line, ',')) {
-        double v;
-        out.push_back(parseDoubleVb6(p, v) ? v : 0.0);
-    }
+    for (std::string_view p : split(line, ',')) out.push_back(parseDoubleVb6(p).value_or(0.0));
     return out;
 }
 
@@ -63,7 +60,7 @@ void parseTrainDat(const std::string& text, TrainSpec& s) {
             const int t = section == "motor_p1" ? 0 : section == "motor_p2" ? 1 : section == "motor_b1" ? 2 : section == "motor_b2" ? 3 : -1;
             if (t >= 0) {
                 MotorSoundEntry m;
-                if (!n.empty()) m.sound = int(std::lround(n[0]));
+                if (const long v = n.empty() ? -1 : std::lround(n[0]); v >= 0) m.sound = int(v); // -1: silent
                 if (n.size() >= 2) m.pitch = float(0.01 * std::max(0.0, n[1]));
                 if (n.size() >= 3) m.gain = float(std::pow(0.0078125 * std::max(0.0, n[2]), 0.25));
                 s.motorSound[std::size_t(t)].push_back(m);
@@ -158,23 +155,20 @@ void parseTrainDat(const std::string& text, TrainSpec& s) {
 glm::dvec3 vec3(std::string_view v) {
     glm::dvec3 r(0.0);
     auto p = split(v, ',');
-    for (std::size_t i = 0; i < 3 && i < p.size(); ++i) parseDoubleVb6(p[i], r[int(i)]);
+    for (std::size_t i = 0; i < 3 && i < p.size(); ++i) r[int(i)] = parseDoubleVb6(p[i]).value_or(r[int(i)]);
     return r;
 }
 
 } // namespace
 
-bool loadTrain(const std::filesystem::path& folder, ObjectLibrary& lib, TrainDef& out, std::string& error) {
-    out = TrainDef{};
+Expected<TrainDef> loadTrain(const std::filesystem::path& folder, ObjectLibrary& lib) {
+    TrainDef out;
     out.folder = folder;
     out.name = folder.filename().string();
     const std::filesystem::path dat = resolvePath(folder, "train.dat");
-    std::string text;
-    if (dat.empty() || !readTextFile(dat, text)) {
-        error = "train.dat not found in " + folder.string();
-        return false;
-    }
-    parseTrainDat(text, out.spec);
+    const std::optional<std::string> datText = dat.empty() ? std::nullopt : readTextFile(dat);
+    if (!datText) return Unexpected("train.dat not found in " + folder.string());
+    parseTrainDat(*datText, out.spec);
     TrainSpec& s = out.spec;
 
     // cars from train.dat
@@ -206,11 +200,11 @@ bool loadTrain(const std::filesystem::path& folder, ObjectLibrary& lib, TrainDef
 
     // extensions.cfg
     const std::filesystem::path ext = resolvePath(folder, "extensions.cfg");
-    if (!ext.empty() && readTextFile(ext, text)) {
+    if (const std::optional<std::string> extText = ext.empty() ? std::nullopt : readTextFile(ext)) {
         std::string section;
         int index = -1;
         bool axlesGiven = false;
-        for (const std::string& raw : splitLines(text)) {
+        for (const std::string& raw : splitLines(*extText)) {
             std::string_view line = raw;
             if (auto sc = line.find(';'); sc != std::string_view::npos) line = line.substr(0, sc);
             line = trim(line);
@@ -220,15 +214,9 @@ bool loadTrain(const std::filesystem::path& folder, ObjectLibrary& lib, TrainDef
                 section.clear();
                 index = -1;
                 axlesGiven = false;
-                for (const char* prefix : {"car", "coupler", "bogie"}) {
-                    if (name.starts_with(prefix)) {
-                        int i;
-                        if (parseIntVb6(std::string_view(name).substr(std::strlen(prefix)), i)) {
-                            section = prefix;
-                            index = i;
-                        }
-                    }
-                }
+                for (std::string_view prefix : {"car", "coupler", "bogie"})
+                    if (name.starts_with(prefix))
+                        if (const auto i = parseIntVb6(std::string_view(name).substr(prefix.size()))) section = prefix, index = *i;
                 if (name == "exterior") section = "exterior";
                 continue;
             }
@@ -243,17 +231,16 @@ bool loadTrain(const std::filesystem::path& folder, ObjectLibrary& lib, TrainDef
                     if (p.empty()) out.warnings.push_back("car object not found: " + std::string(val));
                     else c.exterior = lib.intern(p);
                 } else if (key == "length") {
-                    double l;
-                    if (parseDoubleVb6(val, l) && l > 0) {
-                        c.length = l;
-                        if (!axlesGiven) c.frontAxle = 0.4 * l, c.rearAxle = -0.4 * l;
+                    if (const auto l = parseDoubleVb6(val); l && *l > 0) {
+                        c.length = *l;
+                        if (!axlesGiven) c.frontAxle = 0.4 * *l, c.rearAxle = -0.4 * *l;
                     }
                 } else if (key == "axles") {
                     const auto p = split(val, ',');
-                    double r = 0, f = 0;
-                    if (p.size() >= 2 && parseDoubleVb6(p[0], r) && parseDoubleVb6(p[1], f) && f > r) {
-                        c.rearAxle = r;
-                        c.frontAxle = f;
+                    const auto r = p.size() >= 2 ? parseDoubleVb6(p[0]) : std::nullopt, f = p.size() >= 2 ? parseDoubleVb6(p[1]) : std::nullopt;
+                    if (r && f && *f > *r) {
+                        c.rearAxle = *r;
+                        c.frontAxle = *f;
                         axlesGiven = true;
                     }
                 } else if (key == "reversed") {
@@ -265,15 +252,13 @@ bool loadTrain(const std::filesystem::path& folder, ObjectLibrary& lib, TrainDef
             } else if (section == "coupler" && index >= 0 && index + 1 < count) {
                 if (key == "distances") {
                     const auto p = split(val, ',');
-                    double mn = 0, mx = 0;
-                    if (p.size() >= 2 && parseDoubleVb6(p[0], mn) && parseDoubleVb6(p[1], mx)) out.cars[std::size_t(index)].couplerGap = 0.5 * (mn + mx);
+                    if (p.size() >= 2)
+                        if (const auto mn = parseDoubleVb6(p[0]), mx = parseDoubleVb6(p[1]); mn && mx) out.cars[std::size_t(index)].couplerGap = 0.5 * (*mn + *mx);
                 }
             } else if (section == "exterior") {
-                int i;
-                if (key.starts_with("car") && parseIntVb6(std::string_view(key).substr(3), i) && i >= 0 && i < count) {
-                    std::filesystem::path p = resolvePath(folder, val);
-                    if (!p.empty()) out.cars[std::size_t(i)].exterior = lib.intern(p);
-                }
+                const auto i = key.starts_with("car") ? parseIntVb6(std::string_view(key).substr(3)) : std::nullopt;
+                if (i && *i >= 0 && *i < count)
+                    if (const std::filesystem::path p = resolvePath(folder, val); !p.empty()) out.cars[std::size_t(*i)].exterior = lib.intern(p);
             }
         }
     }
@@ -291,7 +276,7 @@ bool loadTrain(const std::filesystem::path& folder, ObjectLibrary& lib, TrainDef
     const std::filesystem::path panelAnimated = resolvePath(folder, "panel.animated");
     if (!panelAnimated.empty()) out.cab = lib.intern(panelAnimated);
     out.hasPanel2D = !resolvePath(folder, "panel2.cfg").empty() || !resolvePath(folder, "panel.cfg").empty();
-    return true;
+    return out;
 }
 
 std::filesystem::path findTrainFolder(const std::filesystem::path& routeFile, const std::filesystem::path& trainHint, const std::string& name) {

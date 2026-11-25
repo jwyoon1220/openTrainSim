@@ -1,0 +1,14 @@
+// Example VVVF preset (docs/vvvf.md): an IGBT-era pattern. A rising asynchronous carrier with
+// a little random modulation, a short 3-pulse stage, then one-pulse.
+{
+  "name": "IGBT rising carrier",
+  "motor": { "poles": 4, "gear_ratio": 6.5, "wheel_diameter": 0.86, "slip_hz": 1.5 },
+  "base_hz": 60,
+
+  "power": [
+    { "until_kmh": 5,  "async": 700 },
+    { "until_kmh": 40, "async": [1050, 1650], "random": 40 },
+    { "until_kmh": 50, "sync": 3 },
+    { "pulse": 1 }
+  ]
+}

@@ -6,9 +6,11 @@
 
 #include <glm/gtc/matrix_inverse.hpp>
 
+#include <array>
+#include <bit>
 #include <algorithm>
 #include <cmath>
-#include <cstring>
+#include <numbers>
 #include <map>
 #include <unordered_map>
 
@@ -144,11 +146,11 @@ void MeshBuilder::reverseFaces() {
 
 void MeshBuilder::addCube(const glm::vec3& h) {
     const u32 v = u32(vertices.size());
-    const glm::vec3 p[8] = {{h.x, h.y, -h.z}, {h.x, -h.y, -h.z}, {-h.x, -h.y, -h.z}, {-h.x, h.y, -h.z},
-                            {h.x, h.y, h.z},  {h.x, -h.y, h.z},  {-h.x, -h.y, h.z},  {-h.x, h.y, h.z}};
+    const std::array<glm::vec3, 8> p{glm::vec3(h.x, h.y, -h.z), {h.x, -h.y, -h.z}, {-h.x, -h.y, -h.z}, {-h.x, h.y, -h.z},
+                                     {h.x, h.y, h.z},             {h.x, -h.y, h.z},  {-h.x, -h.y, h.z},  {-h.x, h.y, h.z}};
     for (const glm::vec3& q : p) vertices.push_back({q, glm::vec3(0.0f), glm::vec2(0.0f)});
-    const u32 f[6][6] = {{0, 1, 2, 0, 2, 3}, {0, 4, 5, 0, 5, 1}, {0, 3, 7, 0, 7, 4},
-                         {6, 5, 4, 6, 4, 7}, {6, 7, 3, 6, 3, 2}, {6, 2, 1, 6, 1, 5}};
+    constexpr std::array<std::array<u32, 6>, 6> f{{{0, 1, 2, 0, 2, 3}, {0, 4, 5, 0, 5, 1}, {0, 3, 7, 0, 7, 4},
+                                                   {6, 5, 4, 6, 4, 7}, {6, 7, 3, 6, 3, 2}, {6, 2, 1, 6, 1, 5}}};
     for (const auto& face : f) {
         BuilderFace bf;
         bf.triangles = true;
@@ -162,7 +164,7 @@ void MeshBuilder::addCylinder(int n, float upperRadius, float lowerRadius, float
     const bool upperCap = upperRadius > 0.0f, lowerCap = lowerRadius > 0.0f;
     upperRadius = std::abs(upperRadius), lowerRadius = std::abs(lowerRadius);
     const float ns = height >= 0.0f ? 1.0f : -1.0f;
-    const float d = 2.0f * float(M_PI) / float(n);
+    const float d = 2.0f * std::numbers::pi_v<float> / float(n);
     const float g = 0.5f * height;
     const float a = height != 0.0f ? std::atan((lowerRadius - upperRadius) / height) : 0.0f;
     const u32 v = u32(vertices.size());
@@ -222,11 +224,7 @@ struct VertexKeyHash {
         return std::size_t(k.index) * 73856093u ^ std::size_t(k.nx) * 19349663u ^ std::size_t(k.ny) * 83492791u ^ k.nz;
     }
 };
-u32 bits(float f) {
-    u32 u;
-    std::memcpy(&u, &f, 4);
-    return u;
-}
+u32 bits(float f) { return std::bit_cast<u32>(f); }
 
 } // namespace
 
@@ -319,9 +317,7 @@ void mergeParts(StaticMesh& mesh) {
 namespace {
 
 double arg(const std::vector<std::string_view>& a, std::size_t i, double def = 0.0) {
-    double v;
-    if (i < a.size() && !trim(a[i]).empty() && parseDoubleVb6(a[i], v)) return v;
-    return def;
+    return i < a.size() && !trim(a[i]).empty() ? parseDoubleVb6(a[i]).value_or(def) : def;
 }
 
 u32 colorArgs(const std::vector<std::string_view>& a, bool alpha) {
@@ -331,12 +327,11 @@ u32 colorArgs(const std::vector<std::string_view>& a, bool alpha) {
 
 } // namespace
 
-bool loadCsvB3d(const std::filesystem::path& path, StaticMesh& out, std::string& error) {
-    std::string text;
-    if (!readTextFile(path, text)) {
-        error = "cannot read";
-        return false;
-    }
+Expected<StaticMesh> loadCsvB3d(const std::filesystem::path& path) {
+    const auto file = readTextFile(path);
+    if (!file) return Unexpected("cannot read");
+    std::string warning;
+    const std::string& text = *file;
     const bool b3d = iendsWith(path.filename().string(), ".b3d");
     const std::filesystem::path dir = path.parent_path();
     MeshBuilder b;
@@ -381,12 +376,12 @@ bool loadCsvB3d(const std::filesystem::path& path, StaticMesh& out, std::string&
             bool ok = true;
             for (std::string_view s : a) {
                 if (s.empty()) continue;
-                int i;
-                if (!parseIntVb6(s, i) || i < 0 || i >= int(b.vertices.size())) {
+                const auto i = parseIntVb6(s);
+                if (!i || *i < 0 || *i >= int(b.vertices.size())) {
                     ok = false;
                     break;
                 }
-                f.idx.push_back(u32(i));
+                f.idx.push_back(u32(*i));
             }
             if (ok && f.idx.size() >= 3) b.faces.push_back(std::move(f));
         } else if (cmd == "cube") {
@@ -411,7 +406,7 @@ bool loadCsvB3d(const std::filesystem::path& path, StaticMesh& out, std::string&
             const double angle = arg(a, 3);
             if (glm::dot(axis, axis) == 0.0f) axis = glm::vec3(1, 0, 0);
             if (angle != 0.0) {
-                const glm::mat3 m = axisRotation(glm::normalize(axis), float(angle * M_PI / 180.0));
+                const glm::mat3 m = axisRotation(glm::normalize(axis), float(angle * std::numbers::pi / 180.0));
                 b.transform(m, glm::vec3(0.0f));
                 if (cmd == "rotateall") transformAll(m, glm::vec3(0.0f));
             }
@@ -468,20 +463,19 @@ bool loadCsvB3d(const std::filesystem::path& path, StaticMesh& out, std::string&
         } else if (cmd == "loadtexture" || cmd == "load") {
             if (!a.empty() && !a[0].empty()) {
                 const std::filesystem::path tex = resolvePath(dir, a[0]);
-                if (tex.empty()) error = "texture not found: " + std::string(a[0]);
+                if (tex.empty()) warning = "texture not found: " + std::string(a[0]);
                 for (Material& m : b.materials) m.texture = tex.string();
             }
         } else if (cmd == "settexturecoordinates" || cmd == "coordinates") {
-            int i;
-            if (!a.empty() && parseIntVb6(a[0], i) && i >= 0 && i < int(b.vertices.size()))
-                b.vertices[std::size_t(i)].uv = {float(arg(a, 1)), float(arg(a, 2))};
+            const auto i = a.empty() ? std::nullopt : parseIntVb6(a[0]);
+            if (i && *i >= 0 && *i < int(b.vertices.size())) b.vertices[std::size_t(*i)].uv = {float(arg(a, 1)), float(arg(a, 2))};
         }
         // GenerateNormals, SetText, crossfading etc.: no-ops here.
     }
     b.flush(mesh);
     mergeParts(mesh);
-    out = std::move(mesh);
-    return true;
+    mesh.warning = std::move(warning);
+    return mesh;
 }
 
 } // namespace ots

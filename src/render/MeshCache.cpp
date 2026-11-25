@@ -15,6 +15,7 @@ MeshCache::MeshCache(phx::VulkanContext& ctx, phx::UploadQueue& upload, ThreadPo
       indices_(ctx, VkDeviceSize(s.indexHeapMB) * 1024 * 1024 / sizeof(u16), sizeof(u16), VK_BUFFER_USAGE_INDEX_BUFFER_BIT) {}
 
 MeshCache::~MeshCache() {
+    for (Entry& e : entries_) pool_.cancel(e.job);
     pool_.waitIdle();
     for (Entry& e : entries_)
         if (e.state == State::Resident && !e.animated) {
@@ -31,19 +32,24 @@ MeshCache::Entry& MeshCache::entry(ObjectId id) {
 void MeshCache::pin(ObjectId id) {
     if (id == kNoObject) return;
     entry(id).pinned = true;
-    request(id, true);
+    request(id, JobPriority::Critical);
 }
 
 bool MeshCache::failed(ObjectId id) const { return id < entries_.size() && entries_[id].state == State::Failed; }
 
-void MeshCache::request(ObjectId id, bool urgent) {
+void MeshCache::request(ObjectId id, JobPriority priority) {
     if (id == kNoObject) return;
     Entry& e = entry(id);
     e.lastUsed = frame_;
+    if (e.state == State::Loading && priority < e.priority) {
+        e.priority = priority;
+        pool_.raise(e.job, priority); // no-op once a worker has it; the upload order still follows
+    }
     if (e.state != State::None) return;
     e.state = State::Loading;
+    e.priority = priority;
     ++inFlight_;
-    pool_.submit(
+    e.job = pool_.submit(
         [this, id] {
             Packed p;
             p.id = id;
@@ -63,7 +69,7 @@ void MeshCache::request(ObjectId id, bool urgent) {
             std::lock_guard lock(doneMutex_);
             done_.push_back(std::move(p));
         },
-        urgent);
+        priority);
 }
 
 void MeshCache::pack(const StaticMesh& mesh, Packed& out) {
@@ -112,13 +118,14 @@ bool MeshCache::upload(Packed& p) {
         e.animated = true;
         e.state = State::Resident;
         ++resident_;
+        e.job = {};
         const bool pinned = e.pinned; // `e` may dangle once request() grows entries_
         if (const auto& def = lib_[p.id].anim)
             for (const AnimatedPart& part : def->parts)
                 for (ObjectId s : part.states)
                     if (s != kNoObject) {
                         if (pinned) pin(s);
-                        else request(s);
+                        else request(s, JobPriority::Idle);
                     }
         return true;
     }
@@ -150,7 +157,7 @@ bool MeshCache::upload(Packed& p) {
         upload_.uploadBuffer(indices_.buffer().buffer, m.indices.offset * sizeof(u16), p.indices.data(), ibytes);
     }
     std::vector<MaterialId> mats(p.materials.size());
-    for (std::size_t i = 0; i < mats.size(); ++i) mats[i] = materials_.acquire(p.materials[i]);
+    for (std::size_t i = 0; i < mats.size(); ++i) mats[i] = materials_.acquire(p.materials[i], e.priority);
     for (const PackedDraw& d : p.draws)
         m.draws.push_back({u32(m.vertices.offset) + d.vertexBase, u32(m.indices.offset) + d.indexBase, d.indexCount, mats[d.material], d.doubleSided});
     m.materials = std::move(mats);
@@ -159,6 +166,7 @@ bool MeshCache::upload(Packed& p) {
     e.mesh = std::move(m);
     e.state = State::Resident;
     e.animated = false;
+    e.job = {};
     ++resident_;
     return true;
 }
@@ -184,12 +192,15 @@ void MeshCache::update(u64 frame, double frameSeconds) {
         for (Packed& p : done_) waiting_.push_back(std::move(p));
         done_.clear();
     }
+    // most urgent first: the upload budget goes to what is visible
+    std::ranges::stable_sort(waiting_, {}, [&](const Packed& p) { return entries_[p.id].priority; });
     std::size_t keep = 0;
     for (std::size_t i = 0; i < waiting_.size(); ++i) {
         Packed& p = waiting_[i];
         Entry& e = entry(p.id);
         if (!p.ok) {
             e.state = State::Failed;
+            e.job = {};
             --inFlight_;
             continue;
         }
@@ -211,12 +222,16 @@ void MeshCache::update(u64 frame, double frameSeconds) {
     }
 }
 
-const GpuMesh* MeshCache::drawable(ObjectId id, u64 frame) {
+std::size_t MeshCache::pendingCount(JobPriority upTo) const {
+    return std::size_t(std::ranges::count_if(entries_, [&](const Entry& e) { return e.state == State::Loading && e.priority <= upTo; }));
+}
+
+const GpuMesh* MeshCache::drawable(ObjectId id, u64 frame, JobPriority priority) {
     if (id == kNoObject) return nullptr;
     Entry& e = entry(id);
     e.lastUsed = frame;
-    if (e.state == State::None) {
-        request(id);
+    if (e.state == State::None || e.state == State::Loading) {
+        request(id, priority);
         return nullptr;
     }
     if (e.state != State::Resident || e.animated) return nullptr;
@@ -225,12 +240,12 @@ const GpuMesh* MeshCache::drawable(ObjectId id, u64 frame) {
     return &e.mesh;
 }
 
-const AnimatedDef* MeshCache::animated(ObjectId id, u64 frame) {
+const AnimatedDef* MeshCache::animated(ObjectId id, u64 frame, JobPriority priority) {
     if (id == kNoObject) return nullptr;
     Entry& e = entry(id);
     e.lastUsed = frame;
-    if (e.state == State::None) {
-        request(id);
+    if (e.state == State::None || e.state == State::Loading) {
+        request(id, priority);
         return nullptr;
     }
     if (e.state != State::Resident || !e.animated) return nullptr;

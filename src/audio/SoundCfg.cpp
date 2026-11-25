@@ -3,6 +3,7 @@
 #include "util/Paths.hpp"
 #include "util/Text.hpp"
 
+#include <array>
 #include <algorithm>
 #include <charconv>
 #include <format>
@@ -17,7 +18,7 @@ struct NamedSound {
     fs::path TrainSoundFiles::* field;
 };
 
-constexpr NamedSound namedSounds[] = {
+constexpr auto namedSounds = std::to_array<NamedSound>({
     {"brake", "bcreleasehigh", &TrainSoundFiles::bcReleaseHigh},
     {"brake", "bcrelease", &TrainSoundFiles::bcRelease},
     {"brake", "bcreleasefull", &TrainSoundFiles::bcReleaseFull},
@@ -67,7 +68,7 @@ constexpr NamedSound namedSounds[] = {
     {"others", "noise", &TrainSoundFiles::noise},
     {"others", "shoe", &TrainSoundFiles::shoe},
     {"others", "halt", &TrainSoundFiles::halt},
-};
+});
 
 using SoundMap = std::map<int, fs::path>;
 
@@ -76,13 +77,13 @@ struct IndexedSection {
     SoundMap TrainSoundFiles::* field;
 };
 
-constexpr IndexedSection indexedSections[] = {
+constexpr auto indexedSections = std::to_array<IndexedSection>({
     {"run", &TrainSoundFiles::run},
     {"flange", &TrainSoundFiles::flange},
     {"motor", &TrainSoundFiles::motor},
     {"switch", &TrainSoundFiles::pointSwitch},
     {"ats", &TrainSoundFiles::ats},
-};
+});
 
 std::string compact(std::string_view text) {
     std::string result = lower(text);
@@ -136,7 +137,7 @@ bool loadBve2(const fs::path& folder, TrainSoundFiles& out) {
         out.pointSwitch[0] = std::move(point);
         found = true;
     }
-    constexpr std::string_view atsNames[] = {"ats.wav", "atscnt.wav", "ding.wav", "toats.wav", "toatc.wav", "eb.wav"};
+    constexpr std::array<std::string_view, 6> atsNames{"ats.wav", "atscnt.wav", "ding.wav", "toats.wav", "toatc.wav", "eb.wav"};
     for (int index = 0; const auto name : atsNames) {
         if (auto path = resolveSound(folder, name); !path.empty()) {
             out.ats[index] = std::move(path);
@@ -179,15 +180,15 @@ bool loadTrainSounds(const fs::path& trainFolder, TrainSoundFiles& out) {
     const auto warn = [&](std::string_view message) {
         out.warnings.push_back(std::format("{}:{}: {}", pathString(cfg), lineNumber, message));
     };
-    std::string contents;
-    if (!readTextFile(cfg, contents)) {
+    const auto contents = readTextFile(cfg);
+    if (!contents) {
         warn("cannot read sound.cfg");
         return true;
     }
     std::string section;
     SoundMap* indexed = nullptr;
     bool headerSeen = false;
-    for (const auto& raw : splitLines(contents)) {
+    for (const auto& raw : splitLines(*contents)) {
         ++lineNumber;
         const auto line = trim(std::string_view(raw).substr(0, raw.find(';')));
         if (line.empty()) continue;
@@ -217,10 +218,12 @@ bool loadTrainSounds(const fs::path& trainFolder, TrainSoundFiles& out) {
         int index = 0;
         fs::path* field = nullptr;
         if (indexed) {
-            if (!bareSwitch && (!parseIntVb6(key, index) || index < 0)) {
+            const auto parsed = bareSwitch ? std::optional(0) : parseIntVb6(key);
+            if (!parsed || *parsed < 0) {
                 warn(std::format("invalid [{}] index '{}'", section, key));
                 continue;
             }
+            index = *parsed;
         } else {
             const auto normalized = compact(key);
             const auto it = std::ranges::find_if(namedSounds, [&](const NamedSound& sound) {

@@ -2,6 +2,7 @@
 // openBVE MeshBuilder semantics shared by the CSV/B3D and X loaders: vertices + polygon faces
 // with per-face materials, transformed in place, then triangulated into StaticMesh parts.
 #include "bve/Object.hpp"
+#include "util/Expected.hpp"
 
 #include <filesystem>
 
@@ -40,7 +41,7 @@ void mergeParts(StaticMesh& mesh);
 glm::mat3 axisRotation(glm::vec3 axis, float radians);
 
 // Loaders (return false + message on failure).
-bool loadCsvB3d(const std::filesystem::path& path, StaticMesh& out, std::string& error);
-bool loadX(const std::filesystem::path& path, StaticMesh& out, std::string& error);
+Expected<StaticMesh> loadCsvB3d(const std::filesystem::path& path);
+Expected<StaticMesh> loadX(const std::filesystem::path& path);
 
 } // namespace ots

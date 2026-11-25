@@ -4,12 +4,13 @@ Phanerozoic에서 떼어 낸, 다른 게임에서도 쓸 수 있는 C++20 / Vulk
 
 | 모듈 | CMake 타깃 | 내용 |
 |---|---|---|
-| `phx/core` | `phx::core` | 정수·실수 타입, 로그, `TripleBuffer`, PNG 저장 |
+| `phx/core` | `phx::core` | 정수·실수 타입, 로그, `TripleBuffer`, PNG 저장, WAV 디코딩 |
+| `phx/audio` | `phx::audio` | OpenAL 출력. 움직이는 프레임(차량)이나 월드 위치에 붙는 3D 사운드, 거리 감쇠, 가장 큰 소리에만 실제 보이스를 할당 (`phx_audio_executable()`) |
 | `phx/jobs` | `phx::jobs` | 워크 스틸링 잡 시스템 (GPU 의존 없음) |
-| `phx/ui` | `phx::ui` | GUI 라이브러리: 창·탭·폼/플로/보더 레이아웃·버튼·체크박스·슬라이더·콤보박스 → 사각형 정점 (GPU·GLFW 의존 없음) |
+| `phx/ui` | `phx::ui` | GUI 라이브러리: 창·탭·폼/플로/보더 레이아웃·버튼·체크박스·슬라이더·콤보박스, TrueType 글꼴(stb_truetype), 안티에일리어싱 벡터 도형 → 삼각형 정점 (GPU·GLFW 의존 없음) |
 | `phx/platform` | `phx::engine` | GLFW 창, 입력 수집, `UiInput`(GLFW 입력 → `phx::ui`) |
 | `phx/gpu` | `phx::engine` | `VulkanContext`, `Swapchain`(+ NVIDIA Reflex), `Bindless`, 버퍼·이미지·파이프라인, 텍스처 로딩, GPU 타이머 |
-| `phx/render` | `phx::engine` | `Upscaler`(DLSS SR / DLAA / 프레임 생성), `AntiAliasing`(TAA, FSR 1, SSAA, FXAA), `Bloom`, `UiRenderer` |
+| `phx/render` | `phx::engine` | `Upscaler`(DLSS SR / DLAA / 프레임 생성), `AntiAliasing`(TAA, FSR 1, SSAA, FXAA), `Bloom`, `Ssao`(깊이만으로 계산하는 앰비언트 오클루전), `ShadowCascades`(흔들리지 않는 태양 캐스케이드 섀도맵 맞춤), `UiRenderer` |
 
 ## 게임에 붙이기
 
@@ -78,10 +79,29 @@ w.content().add<ui::Button>("Resume").addActionListener([&] { w.close(); });
 for (const InputEvent& e : window.drainInput().events) feedUi(gui, e);
 gui.setScreenSize(width, height);
 if (gui.build(vertices)) uiRenderer.upload(slot, vertices);   // 바뀌었을 때만 다시 만듦
+uiRenderer.prepare(cmd, slot);                                // 렌더 패스 밖: 새로 래스터화한 글리프 행 복사
 uiRenderer.record(cmd, slot, extent);                         // 스왑체인 패스 안에서
 ```
 
-`phx::ui`는 GPU와 무관하므로 단위 테스트(`tests/UiTests.cpp`)로 검증하고, 정점(`ui::Vertex`, 사각형당 4개, 픽셀 좌표)은 다른 스레드로 그대로 넘길 수 있습니다.
+`phx::ui`는 GPU와 무관하므로 단위 테스트(`tests/UiTests.cpp`)로 검증하고, 정점(`ui::Vertex`, 삼각형 목록, 픽셀 좌표, 클립 사각형과 텍스처 슬롯 포함)은 다른 스레드로 그대로 넘길 수 있습니다.
+
+### 글꼴
+
+`ui::fonts()`는 stb_truetype로 글리프를 필요할 때 정확한 픽셀 크기로 래스터화해 R8 아틀라스 하나(2048²)에 담습니다. `UiRenderer`는 바뀐 행만 GPU로 복사합니다. 글꼴은 대체 체인입니다. `addFace(path)`로 앞에 넣고, `addSystemFaces()`가 시스템 라틴 글꼴(Noto Sans, DejaVu Sans, Segoe UI)과 한글 글꼴(Noto Sans CJK KR, 본고딕, 나눔고딕, 맑은 고딕)을 하나씩 찾아 붙입니다. 글자마다 그 글자가 있는 첫 글꼴로 그립니다. 글꼴 파일이 하나도 없으면 예전 비트맵 글꼴(stb_easy_font, ASCII)로 그립니다. 글꼴 크기는 `Theme::fontSize`(0이면 `textScale`에서 계산)입니다.
+
+### 벡터 도형
+
+`Painter`의 도형은 가장자리에 1픽셀 페이드(투명으로 줄어드는 띠)를 붙여 MSAA 없이도 매끄럽습니다.
+
+| 함수 | 그리는 것 |
+|---|---|
+| `fillRoundedRect`, `strokeRoundedRect` | 둥근 사각형 (선은 사각형 안쪽에 그림) |
+| `fillCircle`, `strokeCircle`, `strokeArc`, `fillSector` | 원, 호, 부채꼴·고리 조각 (계기판 바늘, 게이지) |
+| `drawLine`, `strokePolyline` | 선, 꺾은선 (마이터 이음, 1픽셀보다 가는 선은 옅게) |
+| `fillConvex`, `fillTriangle` | 볼록 다각형 (감는 방향 무관) |
+| `fillRectGradient`, `drawImage` | 세로 그라데이션, 바인드리스 텍스처 |
+
+클립(`pushClip`)은 정점마다 실려 셰이더에서 잘립니다. 사각형과 글자는 CPU에서도 잘라 정점 수를 줄입니다.
 
 ## 라이선스 메모
 

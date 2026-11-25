@@ -1,0 +1,8 @@
+// 경부고속선 KTX123 예제: 노선 파일 옆에 KTX123.traffic.json으로 두거나 --traffic로 지정합니다.
+{
+  "trains": [
+    { "name": "선행 KTX 1", "interval": 240 },
+    { "name": "선행 KTX 2", "interval": 600 },
+    { "name": "후속 KTX",   "interval": -300 }
+  ]
+}

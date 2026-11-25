@@ -6,6 +6,7 @@
 
 #include <glm/glm.hpp>
 
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -44,6 +45,7 @@ struct SubMesh {
 
 struct StaticMesh {
     std::vector<SubMesh> parts;
+    std::string warning; // a non-fatal load problem (e.g. a missing texture), empty if none
     glm::vec3 bmin{0.0f}, bmax{0.0f};
     void computeBounds();
     [[nodiscard]] bool empty() const { return parts.empty(); }
@@ -52,6 +54,12 @@ struct StaticMesh {
     void mirrorX();
     // openBVE StaticObject.Transform: platform/crack deformation between two rails.
     void deformBetweenRails(double nearDistance, double farDistance);
+};
+
+// A rigid placement: rotation (columns = local axes) and origin.
+struct RigidPose {
+    glm::dmat3 rotation{1.0};
+    glm::dvec3 position{0.0};
 };
 
 // Damped follower used by Rotate*Damping (natural frequency, damping ratio).
@@ -68,13 +76,13 @@ struct AnimatedPart {
     std::vector<ObjectId> states;   // kNoObject = empty state
     glm::vec3 position{0.0f};
     std::shared_ptr<Function> stateFn;
-    glm::vec3 translateDir[3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
-    std::shared_ptr<Function> translateFn[3];
-    glm::vec3 rotateDir[3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}};
-    std::shared_ptr<Function> rotateFn[3];
-    DampingSpec rotateDamping[3];
-    glm::vec2 textureShiftDir[2] = {{1, 0}, {0, 1}};
-    std::shared_ptr<Function> textureShiftFn[2];
+    std::array<glm::vec3, 3> translateDir{glm::vec3(1, 0, 0), glm::vec3(0, 1, 0), glm::vec3(0, 0, 1)};
+    std::array<std::shared_ptr<Function>, 3> translateFn;
+    std::array<glm::vec3, 3> rotateDir{glm::vec3(1, 0, 0), glm::vec3(0, 1, 0), glm::vec3(0, 0, 1)};
+    std::array<std::shared_ptr<Function>, 3> rotateFn;
+    std::array<DampingSpec, 3> rotateDamping;
+    std::array<glm::vec2, 2> textureShiftDir{glm::vec2(1, 0), glm::vec2(0, 1)};
+    std::array<std::shared_ptr<Function>, 2> textureShiftFn;
     f32 refreshRate = 0.0f;
     [[nodiscard]] bool isStatic() const {
         return !stateFn && !translateFn[0] && !translateFn[1] && !translateFn[2] && !rotateFn[0] && !rotateFn[1] && !rotateFn[2] &&

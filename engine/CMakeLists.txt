@@ -22,9 +22,23 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/PhxShaders.cmake)
 # ---------------------------------------------------------------- dependencies
 include(FetchContent)
 
-find_package(Vulkan REQUIRED GLOBAL)          # headers (+ loader, volk loads dynamically anyway)
+# Only the Vulkan headers are needed: volk loads the loader (vulkan-1.dll / libvulkan.so.1) at run
+# time. Taken from the Vulkan SDK / system, else fetched (e.g. cross builds).
+find_package(Vulkan QUIET GLOBAL)
+if (NOT TARGET Vulkan::Headers)
+    FetchContent_Declare(vulkan-headers URL https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.304.tar.gz)
+    FetchContent_MakeAvailable(vulkan-headers)
+    set(VULKAN_HEADERS_INSTALL_DIR ${vulkan-headers_SOURCE_DIR} CACHE PATH "Vulkan headers for volk" FORCE)
+endif ()
 find_package(Threads REQUIRED GLOBAL)
-find_package(glm REQUIRED GLOBAL)
+find_package(glm QUIET GLOBAL)
+if (NOT glm_FOUND AND NOT TARGET glm::glm)   # e.g. Windows without vcpkg: header-only, fetched
+    FetchContent_Declare(glm URL https://github.com/g-truc/glm/archive/refs/tags/1.0.3.tar.gz)
+    set(GLM_BUILD_LIBRARY OFF CACHE BOOL "" FORCE)
+    set(GLM_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(GLM_BUILD_INSTALL OFF CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(glm)
+endif ()
 
 find_package(glfw3 3.4 QUIET GLOBAL)
 if (NOT glfw3_FOUND AND NOT TARGET glfw)
@@ -69,19 +83,28 @@ foreach (f ffx_a.h ffx_fsr1.h)
     endif ()
 endforeach ()
 
-# NVIDIA DLSS (NGX SDK, "NVIDIA RTX SDKs" licence: LICENSE.txt in the SDK). Linux x86_64 only;
-# headers, the static NGX loader and the DLSS runtime are fetched at configure time.
+# NVIDIA DLSS (NGX SDK, "NVIDIA RTX SDKs" licence: LICENSE.txt in the SDK). Linux x86_64 and
+# Windows x64 (MSVC); headers, the static NGX loader and the DLSS runtime are fetched at
+# configure time.
 set(PHX_DLSS_VERSION 310.9.16)
 set(PHX_DLSS_AVAILABLE OFF)
 set(PHX_RUNTIME_FILES)
+set(PHX_DLSS_PLATFORM)
 if (PHX_DLSS AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    set(PHX_DLSS_PLATFORM Linux)
+    set(PHX_DLSS_LIBS lib/Linux_x86_64/libnvsdk_ngx.a)
+    set(PHX_DLSS_RUNTIME lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.${PHX_DLSS_VERSION}
+                         lib/Linux_x86_64/rel/libnvidia-ngx-dlssg.so.${PHX_DLSS_VERSION})
+elseif (PHX_DLSS AND WIN32 AND MSVC AND CMAKE_SIZEOF_VOID_P EQUAL 8)
+    # nvsdk_ngx_d: dynamic CRT (/MD); _dbg: debug CRT (/MDd)
+    set(PHX_DLSS_PLATFORM Windows)
+    set(PHX_DLSS_LIBS lib/Windows_x86_64/x64/nvsdk_ngx_d.lib lib/Windows_x86_64/x64/nvsdk_ngx_d_dbg.lib)
+    set(PHX_DLSS_RUNTIME lib/Windows_x86_64/rel/nvngx_dlss.dll lib/Windows_x86_64/rel/nvngx_dlssg.dll)
+endif ()
+if (PHX_DLSS_PLATFORM)
     set(PHX_DLSS_DIR ${CMAKE_BINARY_DIR}/_deps/dlss-sdk-${PHX_DLSS_VERSION})
     set(PHX_DLSS_URL https://raw.githubusercontent.com/NVIDIA/DLSS/v${PHX_DLSS_VERSION})
-    set(PHX_DLSS_FILES
-        LICENSE.txt
-        lib/Linux_x86_64/libnvsdk_ngx.a
-        lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.${PHX_DLSS_VERSION}
-        lib/Linux_x86_64/rel/libnvidia-ngx-dlssg.so.${PHX_DLSS_VERSION})
+    set(PHX_DLSS_FILES LICENSE.txt ${PHX_DLSS_LIBS} ${PHX_DLSS_RUNTIME})
     foreach (h nvsdk_ngx.h nvsdk_ngx_defs.h nvsdk_ngx_defs_dlssd.h nvsdk_ngx_defs_dlssg.h nvsdk_ngx_defs_vk.h
                nvsdk_ngx_helpers.h nvsdk_ngx_helpers_vk.h nvsdk_ngx_helpers_dlssd.h nvsdk_ngx_helpers_dlssd_vk.h
                nvsdk_ngx_helpers_dlssg.h nvsdk_ngx_helpers_dlssg_vk.h nvsdk_ngx_params.h nvsdk_ngx_params_dlssd.h
@@ -106,25 +129,50 @@ if (PHX_DLSS AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR M
     endforeach ()
     if (PHX_DLSS_OK)
         add_library(phx_ngx STATIC IMPORTED)
-        set_target_properties(phx_ngx PROPERTIES
-            IMPORTED_LOCATION ${PHX_DLSS_DIR}/lib/Linux_x86_64/libnvsdk_ngx.a
-            INTERFACE_INCLUDE_DIRECTORIES ${PHX_DLSS_DIR}/include
-            INTERFACE_LINK_LIBRARIES "${CMAKE_DL_LIBS};stdc++")
+        set_target_properties(phx_ngx PROPERTIES INTERFACE_INCLUDE_DIRECTORIES ${PHX_DLSS_DIR}/include)
+        if (PHX_DLSS_PLATFORM STREQUAL "Linux")
+            set_target_properties(phx_ngx PROPERTIES
+                IMPORTED_LOCATION ${PHX_DLSS_DIR}/lib/Linux_x86_64/libnvsdk_ngx.a
+                INTERFACE_LINK_LIBRARIES "${CMAKE_DL_LIBS};stdc++")
+        else ()
+            set_target_properties(phx_ngx PROPERTIES
+                IMPORTED_CONFIGURATIONS "DEBUG;RELEASE"
+                IMPORTED_LOCATION_RELEASE ${PHX_DLSS_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib
+                IMPORTED_LOCATION_DEBUG ${PHX_DLSS_DIR}/lib/Windows_x86_64/x64/nvsdk_ngx_d_dbg.lib
+                MAP_IMPORTED_CONFIG_RELWITHDEBINFO RELEASE
+                MAP_IMPORTED_CONFIG_MINSIZEREL RELEASE)
+        endif ()
         # The DLSS runtime ("snippet") is loaded by NGX from the application directory:
         # phx_engine_executable() copies it next to the executable.
-        foreach (rt dlss dlssg)
-            list(APPEND PHX_RUNTIME_FILES ${PHX_DLSS_DIR}/lib/Linux_x86_64/rel/libnvidia-ngx-${rt}.so.${PHX_DLSS_VERSION})
+        foreach (rt ${PHX_DLSS_RUNTIME})
+            list(APPEND PHX_RUNTIME_FILES ${PHX_DLSS_DIR}/${rt})
         endforeach ()
         set(PHX_DLSS_AVAILABLE ON)
     endif ()
 endif ()
 
-set(PHX_WARNINGS -Wall -Wextra)
+# Compiler flags: GCC / Clang and MSVC (cl / clang-cl).
+if (MSVC)
+    # /utf-8: sources and string literals are UTF-8. Implicit narrowing (C4244/4267/4305) is not
+    # what -Wall warns about either.
+    set(PHX_WARNINGS /W3 /wd4244 /wd4267 /wd4305 /wd4996)
+    set(PHX_NO_FIELD_INIT)
+    if (PROJECT_IS_TOP_LEVEL) # a game sets these itself, before add_subdirectory(engine)
+        add_compile_options(/utf-8 /bigobj /Zc:preprocessor "$<$<COMPILE_LANGUAGE:CXX>:/permissive-;/Zc:__cplusplus;/EHsc>")
+    endif ()
+else ()
+    set(PHX_WARNINGS -Wall -Wextra)
+    set(PHX_NO_FIELD_INIT -Wno-missing-field-initializers)
+endif ()
+if (WIN32 AND PROJECT_IS_TOP_LEVEL)
+    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
+endif ()
 
 # ---------------------------------------------------------------- core (logging, PNG, types)
 add_library(phx_core STATIC
     phx/core/Log.cpp
-    phx/core/Png.cpp)
+    phx/core/Png.cpp
+    phx/core/Wav.cpp)
 add_library(phx::core ALIAS phx_core)
 target_include_directories(phx_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(phx_core PUBLIC cxx_std_20)
@@ -139,6 +187,7 @@ target_compile_options(phx_jobs PRIVATE ${PHX_WARNINGS})
 
 # ---------------------------------------------------------------- UI (retained widgets → quads; GPU-free)
 add_library(phx_ui STATIC
+    phx/ui/Font.cpp
     phx/ui/Layout.cpp
     phx/ui/Painter.cpp
     phx/ui/Widgets.cpp
@@ -161,6 +210,8 @@ add_library(phx_engine STATIC
     phx/platform/Window.cpp
     phx/render/AntiAliasing.cpp
     phx/render/Bloom.cpp
+    phx/render/ShadowCascades.cpp
+    phx/render/Ssao.cpp
     phx/render/UiRenderer.cpp
     phx/render/Upscaler.cpp)
 add_library(phx::engine ALIAS phx_engine)
@@ -174,11 +225,41 @@ if (PHX_DLSS_AVAILABLE)
 endif ()
 set_property(TARGET phx_engine PROPERTY PHX_RUNTIME_FILES "${PHX_RUNTIME_FILES}")
 # Vulkan structs are initialised as `T x{sType}`; the remaining members are zeroed by design.
-target_compile_options(phx_engine PRIVATE ${PHX_WARNINGS} -Wno-missing-field-initializers)
-# Third-party implementation TU: don't hold it to our warning level.
-set_source_files_properties(phx/gpu/VmaImpl.cpp PROPERTIES COMPILE_OPTIONS "-w")
-set_source_files_properties(phx/gpu/Textures.cpp PROPERTIES COMPILE_OPTIONS "-O2;-Wno-unused-function")
-set_source_files_properties(phx/gpu/BlockCompress.cpp PROPERTIES COMPILE_OPTIONS "-O2")
+target_compile_options(phx_engine PRIVATE ${PHX_WARNINGS} ${PHX_NO_FIELD_INIT})
+# Third-party implementation TU: don't hold it to our warning level. Texture compression is
+# optimised even in debug builds (GCC / Clang only: MSVC refuses /O2 with /RTC1).
+if (MSVC)
+    set_source_files_properties(phx/gpu/VmaImpl.cpp PROPERTIES COMPILE_OPTIONS "/w")
+else ()
+    set_source_files_properties(phx/gpu/VmaImpl.cpp PROPERTIES COMPILE_OPTIONS "-w")
+    set_source_files_properties(phx/gpu/Textures.cpp PROPERTIES COMPILE_OPTIONS "-O2;-Wno-unused-function")
+    set_source_files_properties(phx/gpu/BlockCompress.cpp PROPERTIES COMPILE_OPTIONS "-O2")
+endif ()
+
+# ---------------------------------------------------------------- audio (OpenAL output, 3D sounds)
+# OpenAL Soft (LGPL): the system's, else (Windows) built from source as OpenAL32.dll — kept
+# dynamically linked; phx_audio_executable() copies it next to the executable.
+find_package(OpenAL QUIET)
+if (NOT OpenAL_FOUND AND NOT TARGET OpenAL::OpenAL)
+    FetchContent_Declare(openal-soft URL https://github.com/kcat/openal-soft/archive/refs/tags/1.25.2.tar.gz)
+    if (MINGW) # the DLL must not need the MinGW C++ runtime DLLs
+        set(ALSOFT_STATIC_LIBGCC ON CACHE BOOL "" FORCE)
+        set(ALSOFT_STATIC_STDCXX ON CACHE BOOL "" FORCE)
+        set(ALSOFT_STATIC_WINPTHREAD ON CACHE BOOL "" FORCE)
+    endif ()
+    foreach (opt ALSOFT_BACKEND_PIPEWIRE ALSOFT_BACKEND_PULSEAUDIO ALSOFT_BACKEND_ALSA ALSOFT_BACKEND_OSS ALSOFT_BACKEND_JACK
+                 ALSOFT_BACKEND_SNDIO ALSOFT_BACKEND_PORTAUDIO ALSOFT_BACKEND_SDL2 ALSOFT_BACKEND_SDL3 ALSOFT_UTILS
+                 ALSOFT_EXAMPLES ALSOFT_TESTS ALSOFT_INSTALL ALSOFT_INSTALL_CONFIG ALSOFT_INSTALL_HRTF_DATA
+                 ALSOFT_INSTALL_AMBDEC_PRESETS ALSOFT_INSTALL_EXAMPLES ALSOFT_INSTALL_UTILS ALSOFT_UPDATE_BUILD_VERSION)
+        set(${opt} OFF CACHE BOOL "" FORCE)
+    endforeach ()
+    FetchContent_MakeAvailable(openal-soft)
+endif ()
+add_library(phx_audio STATIC
+    phx/audio/AudioSystem.cpp)
+add_library(phx::audio ALIAS phx_audio)
+target_link_libraries(phx_audio PUBLIC phx_core glm::glm PRIVATE OpenAL::OpenAL)
+target_compile_options(phx_audio PRIVATE ${PHX_WARNINGS})
 
 # ---------------------------------------------------------------- engine shaders → <shader dir>/phx/*.spv
 file(GLOB PHX_ENGINE_SHADERS CONFIGURE_DEPENDS
@@ -191,7 +272,7 @@ phx_add_shaders(phx_engine_shaders PREFIX phx SOURCES ${PHX_ENGINE_SHADERS} INCL
 if (PHX_BUILD_EXAMPLES)
     add_executable(phx_ui_demo examples/ui_demo.cpp)
     phx_engine_executable(phx_ui_demo)
-    target_compile_options(phx_ui_demo PRIVATE ${PHX_WARNINGS} -Wno-missing-field-initializers)
+    target_compile_options(phx_ui_demo PRIVATE ${PHX_WARNINGS} ${PHX_NO_FIELD_INIT})
 endif ()
 
 # ---------------------------------------------------------------- tests
