@@ -67,6 +67,8 @@ private:
         JobPriority priority = JobPriority::Idle; // most urgent request so far (this load)
         JobTicket job;
         u64 lastUsed = 0;
+        u64 readyVersion = 0; // MaterialTable::version() when `ready` was computed (0 = never)
+        bool ready = false;
         GpuMesh mesh;
     };
     struct PackedDraw {

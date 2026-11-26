@@ -56,6 +56,14 @@ struct GpuFrame {
     glm::vec4 shadowParams;      // x: cascades (0 = off), y: atlas texels, z: atlas slot, w: strength
     glm::vec4 lighting;          // x: hemisphere ambient 0..1, y: sun specular
     glm::vec4 post;              // x: bloom, y: saturation, z: contrast, w: vignette
+    // physical sky (sky.glsl)
+    glm::mat4 invViewProj;         // clip → camera-relative world (jittered, matches viewProj)
+    glm::mat4 equatorialFromWorld; // world direction → J2000 equatorial (upper 3×3)
+    glm::vec4 sunDir;              // xyz: towards the sun, w: moon lit fraction
+    glm::vec4 moonDir;             // xyz: towards the moon
+    glm::vec4 sky;                 // x: 1 = physical sky, y: exposure, z: star brightness, w: Milky Way (Gaia) brightness
+    glm::vec4 skyMaps;             // x: star map slot, y: Gaia map slot, z: star map HDR scale
+    glm::vec4 fogSun;              // physical sky: horizon (fog) colour towards the sun; fogColor = away
 };
 
 struct PushConstants {

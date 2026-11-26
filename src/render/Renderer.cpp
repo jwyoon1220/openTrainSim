@@ -4,6 +4,7 @@
 #include "phx/core/Log.hpp"
 #include "phx/core/Png.hpp"
 #include "phx/render/PostSlots.hpp"
+#include "util/Platform.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -151,6 +152,7 @@ std::optional<AaMode> parseAaMode(std::string_view s) {
 Renderer::Renderer(phx::Window& window, const RenderSettings& s, ObjectLibrary& lib, ThreadPool& pool)
     : settings_(s), lib_(lib), pool_(pool), window_(window) {
     ctx_ = std::make_unique<phx::VulkanContext>(window, s.validation);
+    ctx_->usePipelineCacheFile(userCacheDir() / "pipelines.bin");
     upscaler_ = std::make_unique<phx::Upscaler>(*ctx_);
     swapchainExtra_ = 0;
     swapchain_ = std::make_unique<phx::Swapchain>(*ctx_, window.framebufferSize(), s.vsync ? phx::PresentPolicy::Vsync : phx::PresentPolicy::LowLatency);
@@ -255,7 +257,7 @@ void Renderer::destroyTargets() {
 }
 
 void Renderer::destroyPipelines() {
-    for (VkPipeline* p : {&opaque_[0], &opaque_[1], &blend_[0], &blend_[1], &additive_, &background_, &tonemap_, &shadowPipe_}) {
+    for (VkPipeline* p : {&opaque_[0], &opaque_[1], &blend_[0], &blend_[1], &additive_, &background_, &tonemap_, &shadowPipe_, &sky_}) {
         if (*p) vkDestroyPipeline(ctx_->device, *p, nullptr);
         *p = VK_NULL_HANDLE;
     }
@@ -386,6 +388,10 @@ void Renderer::createPipelines() {
     b.blend = phx::BlendMode::Alpha;
     b.colorWriteMask2 = 0xF;
     background_ = phx::createGraphicsPipeline(*ctx_, *bindless_, b);
+    b.vertex = "sky.vert";
+    b.fragment = "sky.frag";
+    b.blend = phx::BlendMode::Opaque;
+    sky_ = phx::createGraphicsPipeline(*ctx_, *bindless_, b);
     phx::GraphicsPipelineDesc t;
     t.vertex = "phx/fullscreen.vert";
     t.fragment = "tonemap.frag";
@@ -420,6 +426,7 @@ void Renderer::ensureShadowAtlas() {
 void Renderer::ensureFrameCapacity(FrameData& f, std::size_t materials, std::size_t instances) {
     if (f.data.buffer && materials <= f.materialCapacity && instances <= f.instanceCapacity) return;
     phx::destroyBuffer(*ctx_, f.data);
+    f.materialVersion = ~0ull; // new buffer: the material table must be written again
     f.materialCapacity = std::max(materials * 3 / 2, f.materialCapacity);
     f.instanceCapacity = std::max(instances * 3 / 2, f.instanceCapacity);
     const VkDeviceSize bytes = kFrameHeader + f.materialCapacity * sizeof(GpuMaterial) + 64 + f.instanceCapacity * sizeof(GpuInstance);
@@ -801,7 +808,16 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
 
     // sun shadow cascades (before gathering: they decide which objects cast)
     cascadeCount_ = 0;
-    const glm::vec3 toLight = glm::length(sim.route.lightDirection) > 0.0f ? glm::normalize(sim.route.lightDirection) : glm::vec3(0, 1, 0);
+    // physical sky: sun / moon and the lighting they give (updated every few simulated seconds;
+    // the sky itself is evaluated per pixel every frame)
+    const bool physicalSky = settings_.sky.enabled;
+    if (physicalSky && std::abs(sim.time - skyLightTime_) > 2.0) {
+        skyLightTime_ = sim.time;
+        skyPos_ = skyPositions(settings_.sky.date, sim.time, settings_.sky.place);
+        skyLight_ = skyLighting(skyPos_, sim.route.ambient, sim.route.diffuse);
+    }
+    const glm::vec3 routeLight = glm::length(sim.route.lightDirection) > 0.0f ? glm::normalize(sim.route.lightDirection) : glm::vec3(0, 1, 0);
+    const glm::vec3 toLight = physicalSky ? skyLight_.lightDirection : routeLight;
     if (settings_.shadows && toLight.y > 0.02f) {
         ensureShadowAtlas();
         phx::ShadowCascadeInput sci;
@@ -848,24 +864,45 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     // Groups are ordered by the first appearance of each object (= file / placement order, like
     // openBVE's draw order), instances keep gather order inside a group.
     {
-        std::unordered_map<ObjectId, u32> first;
-        first.reserve(items_.size());
-        for (u32 i = 0; i < items_.size(); ++i) first.try_emplace(items_[i].object, i);
-        for (Item& it : items_) it.order = first[it.object];
-        std::stable_sort(items_.begin(), items_.end(), [](const Item& a, const Item& b) { return a.order < b.order; });
+        // Group by first appearance with a counting sort: O(n), stable, no hashing, no allocation
+        // once the scratch arrays have grown. objectGroup_ is indexed by ObjectId and stamped
+        // with a frame counter, so it never needs clearing.
+        ++groupStamp_;
+        u32 groups = 0;
+        groupStart_.clear();
+        for (Item& it : items_) {
+            const ObjectId o = it.object;
+            if (o >= objectGroup_.size()) objectGroup_.resize(std::max<std::size_t>(o + 1, objectGroup_.size() * 2), {0u, 0u});
+            auto& g = objectGroup_[o];
+            if (g.first != groupStamp_) {
+                g = {groupStamp_, groups++};
+                groupStart_.push_back(0);
+            }
+            it.order = g.second;
+            ++groupStart_[g.second];
+        }
+        u32 sum = 0;
+        for (u32& c : groupStart_) {
+            const u32 n = c;
+            c = sum;
+            sum += n;
+        }
+        sortedItems_.resize(items_.size());
+        for (const Item& it : items_) sortedItems_[groupStart_[it.order]++] = it;
+        items_.swap(sortedItems_);
     }
-    struct Cmd {
-        const GpuDraw* draw;
-        u32 firstInstance, count;
-        f32 distance;
-        AlphaMode mode;
-    };
     // Instances are written list by list: the main view, then each shadow cascade. Each
     // (object, material) of a list is one instanced draw over a contiguous range.
-    std::vector<GpuInstance> instances;
+    std::vector<GpuInstance>& instances = scratchInstances_;
+    instances.clear();
     instances.reserve(items_.size() * 2);
-    std::vector<Cmd> opaque, blended, shadowCmds[kCascades];
-    std::vector<u32> group;
+    std::vector<Cmd>& opaque = scratchOpaque_;
+    std::vector<Cmd>& blended = scratchBlended_;
+    auto& shadowCmds = scratchShadow_;
+    opaque.clear();
+    blended.clear();
+    for (auto& v : shadowCmds) v.clear();
+    std::vector<u32>& group = scratchGroup_;
     for (std::size_t i = 0; i < items_.size();) {
         std::size_t j = i;
         while (j < items_.size() && items_[j].order == items_[i].order) ++j;
@@ -905,14 +942,35 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
         i = j;
     }
     // back to front; equal distances keep file / gather order
-    std::stable_sort(blended.begin(), blended.end(), [](const Cmd& a, const Cmd& b) { return std::lround(a.distance * 1000.0f) > std::lround(b.distance * 1000.0f); });
+    // Integer key computed once per command instead of twice per comparison.
+    for (Cmd& c : blended) c.key = std::lround(c.distance * 1000.0f);
+    std::stable_sort(blended.begin(), blended.end(), [](const Cmd& a, const Cmd& b) { return a.key > b.key; });
+    // Merge runs of the same draw over consecutive instances into one instanced draw. Instances
+    // of one draw are rasterised in instance order, so back-to-front order is preserved.
+    if (!blended.empty()) {
+        std::size_t w = 0;
+        for (std::size_t r = 1; r < blended.size(); ++r) {
+            Cmd& last = blended[w];
+            const Cmd& c = blended[r];
+            if (c.draw == last.draw && c.mode == last.mode && c.firstInstance == last.firstInstance + last.count) ++last.count;
+            else blended[++w] = c;
+        }
+        blended.resize(w + 1);
+    }
 
     // per-frame data: header, materials, instances
     ensureFrameCapacity(f, materials_->size() + 16, instances.size() + 16);
     auto* base = static_cast<u8*>(f.data.mapped);
     const VkDeviceSize matOffset = kFrameHeader;
     const VkDeviceSize instOffset = (matOffset + f.materialCapacity * sizeof(GpuMaterial) + 63) / 64 * 64;
-    materials_->write(reinterpret_cast<GpuMaterial*>(base + matOffset), u32(f.materialCapacity));
+    // The material table only changes when a material or texture changes state: rewrite this
+    // slot's copy only then (and after the buffer was reallocated).
+    const u64 matVersion = materials_->version();
+    const bool matDirty = f.materialVersion != matVersion;
+    if (matDirty) {
+        materials_->write(reinterpret_cast<GpuMaterial*>(base + matOffset), u32(f.materialCapacity));
+        f.materialVersion = matVersion;
+    }
     auto* inst = reinterpret_cast<GpuInstance*>(base + instOffset);
     std::ranges::copy(instances, inst);
 
@@ -920,18 +978,36 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     fr.viewProj = viewProjJ;
     fr.viewProjNoJitter = viewProj;
     fr.prevViewProj = havePrev_ ? prevViewProj_ : viewProj;
-    fr.lightDir = glm::vec4(sim.route.lightDirection, 0.0f);
-    fr.ambient = glm::vec4(sim.route.ambient, 1.0f);
-    fr.diffuse = glm::vec4(sim.route.diffuse, 1.0f);
+    fr.lightDir = glm::vec4(physicalSky ? skyLight_.lightDirection : sim.route.lightDirection, 0.0f);
+    fr.ambient = glm::vec4(physicalSky ? skyLight_.ambient : sim.route.ambient, 1.0f);
+    fr.diffuse = glm::vec4(physicalSky ? skyLight_.diffuse : sim.route.diffuse, 1.0f);
     const Fog fog = sim.route.fogAt(cam.trackPosition);
     const glm::vec3 fogColor = glm::vec3(float(fog.color & 0xFF), float((fog.color >> 8) & 0xFF), float((fog.color >> 16) & 0xFF)) / 255.0f;
     fr.fog = glm::vec4(fog.start, fog.end, fog.end > fog.start ? 1.0f : 0.0f, samples_ != VK_SAMPLE_COUNT_1_BIT ? 1.0f : 0.0f);
-    fr.fogColor = glm::vec4(fogColor, 1.0f);
+    fr.fogColor = glm::vec4(physicalSky ? skyLight_.fogColor : fogColor, 1.0f);
+    if (physicalSky) {
+        if (!skyMapsRequested_) {
+            skyMapsRequested_ = true;
+            const SkySettings& ss = settings_.sky;
+            if (!ss.starMap.empty() && ss.stars > 0.0f) starMap_ = textures_->acquireRaw(ss.starMap, ss.starMapSize, ss.starMapHdrScale);
+            if (!ss.milkyWayMap.empty() && ss.milkyWay > 0.0f) milkyWayMap_ = textures_->acquireRaw(ss.milkyWayMap, 8192, 0.0f);
+        }
+        fr.invViewProj = glm::inverse(viewProjJ);
+        fr.equatorialFromWorld = glm::mat4(glm::mat3(skyPos_.equatorialFromWorld));
+        fr.sunDir = glm::vec4(glm::vec3(skyPos_.sun), float(skyPos_.moonIllumination));
+        fr.moonDir = glm::vec4(glm::vec3(skyPos_.moon), 0.0f);
+        fr.sky = glm::vec4(1.0f, skyLight_.exposure, settings_.sky.stars, settings_.sky.milkyWay);
+        const u32 starSlot = starMap_ != kNone ? textures_->slot(starMap_, false) : 0;
+        const u32 gaiaSlot = milkyWayMap_ != kNone ? textures_->slot(milkyWayMap_, false) : 0;
+        fr.skyMaps = glm::vec4(float(starSlot), float(gaiaSlot), settings_.sky.starMapHdrScale, 0.0f);
+        fr.fogSun = glm::vec4(skyLight_.fogSun, 1.0f);
+    }
     {
         const auto bg = sim.route.backgroundAt(cam.trackPosition);
-        std::string path;
-        if (bg && *bg < sim.route.backgrounds.size()) path = sim.route.backgrounds[*bg].texture.string();
-        if (path != backgroundPath_) {
+        const int bgIndex = bg && *bg < sim.route.backgrounds.size() ? int(*bg) : -1;
+        if (bgIndex != backgroundIndex_ && !physicalSky) { // the physical sky replaces background images
+            backgroundIndex_ = bgIndex;
+            const std::string path = bgIndex >= 0 ? sim.route.backgrounds[bgIndex].texture.string() : std::string{};
             const TextureId old = backgroundTexture_;
             backgroundTexture_ = path.empty() ? kNone : textures_->acquire(path, false, 0, 0, 0, JobPriority::Near);
             textures_->release(old);
@@ -948,9 +1024,14 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     }
     fr.lighting = glm::vec4(settings_.hemisphere, settings_.specular, 0.0f, 0.0f);
     fr.post = glm::vec4(settings_.bloom, settings_.saturation, settings_.contrast, settings_.vignette);
-    fr.shadowParams = glm::vec4(float(cascadeCount_), float(shadowAtlasSize_), float(shadowSlot_), std::clamp(settings_.shadowStrength, 0.0f, 1.0f));
+    fr.shadowParams = glm::vec4(float(cascadeCount_), float(shadowAtlasSize_), float(shadowSlot_), std::clamp(settings_.shadowStrength * (physicalSky ? skyLight_.shadowStrength : 1.0f), 0.0f, 1.0f));
     std::memcpy(base, &fr, sizeof(fr));
-    vmaFlushAllocation(ctx_->allocator, f.data.allocation, 0, VK_WHOLE_SIZE);
+    // flush only what was written (a no-op on coherent memory)
+    if (matDirty) vmaFlushAllocation(ctx_->allocator, f.data.allocation, 0, instOffset + instances.size() * sizeof(GpuInstance));
+    else {
+        vmaFlushAllocation(ctx_->allocator, f.data.allocation, 0, sizeof(fr));
+        if (!instances.empty()) vmaFlushAllocation(ctx_->allocator, f.data.allocation, instOffset, instances.size() * sizeof(GpuInstance));
+    }
     ui_->upload(slot_, hud);
     profiler_.lap(CpuStage::Build);
 
@@ -1081,9 +1162,9 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
     vkCmdSetViewport(cmd, 0, 1, &vp);
     vkCmdSetScissor(cmd, 0, 1, &ri.renderArea);
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, bindless_->pipelineLayout, 0, 1, &bindless_->set, 0, nullptr);
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, background_);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, physicalSky ? sky_ : background_);
     vkCmdPushConstants(cmd, bindless_->pipelineLayout, VK_SHADER_STAGE_ALL, 0, sizeof(pc), &pc);
-    vkCmdDraw(cmd, 32 * 12, 1, 0, 0);
+    vkCmdDraw(cmd, physicalSky ? 3 : 32 * 12, 1, 0, 0);
     ++draws;
     vkCmdBindIndexBuffer(cmd, meshes_->indexHeap().buffer().buffer, 0, VK_INDEX_TYPE_UINT16);
     VkPipeline bound = VK_NULL_HANDLE;
@@ -1101,7 +1182,7 @@ void Renderer::render(const Simulation& sim, const CameraState& cam, std::span<c
         bind(c.mode == AlphaMode::Additive ? additive_ : blend_[(c.draw->doubleSided || !backfaceCulling_) ? 1 : 0]);
         pc.material = c.draw->material;
         vkCmdPushConstants(cmd, bindless_->pipelineLayout, VK_SHADER_STAGE_ALL, 0, sizeof(pc), &pc);
-        vkCmdDrawIndexed(cmd, c.draw->indexCount, 1, c.draw->firstIndex, i32(c.draw->vertexOffset), c.firstInstance);
+        vkCmdDrawIndexed(cmd, c.draw->indexCount, c.count, c.draw->firstIndex, i32(c.draw->vertexOffset), c.firstInstance);
         ++draws;
     }
     vkCmdEndRendering(cmd);

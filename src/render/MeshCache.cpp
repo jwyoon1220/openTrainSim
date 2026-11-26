@@ -164,6 +164,7 @@ bool MeshCache::upload(Packed& p) {
     m.radius = p.radius;
     m.center = p.center;
     e.mesh = std::move(m);
+    e.readyVersion = 0;
     e.state = State::Resident;
     e.animated = false;
     e.job = {};
@@ -193,7 +194,8 @@ void MeshCache::update(u64 frame, double frameSeconds) {
         done_.clear();
     }
     // most urgent first: the upload budget goes to what is visible
-    std::ranges::stable_sort(waiting_, {}, [&](const Packed& p) { return entries_[p.id].priority; });
+    const auto meshPriority = [&](const Packed& p) { return entries_[p.id].priority; };
+    if (!std::ranges::is_sorted(waiting_, {}, meshPriority)) std::ranges::stable_sort(waiting_, {}, meshPriority);
     std::size_t keep = 0;
     for (std::size_t i = 0; i < waiting_.size(); ++i) {
         Packed& p = waiting_[i];
@@ -235,9 +237,14 @@ const GpuMesh* MeshCache::drawable(ObjectId id, u64 frame, JobPriority priority)
         return nullptr;
     }
     if (e.state != State::Resident || e.animated) return nullptr;
-    for (const GpuDraw& d : e.mesh.draws)
-        if (!materials_.ready(d.material)) return nullptr;
-    return &e.mesh;
+    // Material readiness only changes with the material table's version: cache it per mesh
+    // instead of walking every draw every frame.
+    const u64 v = materials_.version();
+    if (e.readyVersion != v) {
+        e.readyVersion = v;
+        e.ready = std::ranges::all_of(e.mesh.draws, [&](const GpuDraw& d) { return materials_.ready(d.material); });
+    }
+    return e.ready ? &e.mesh : nullptr;
 }
 
 const AnimatedDef* MeshCache::animated(ObjectId id, u64 frame, JobPriority priority) {

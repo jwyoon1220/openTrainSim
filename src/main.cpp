@@ -69,6 +69,8 @@ viewDistance = 1500
 textureMaxSize = 2048
 ; BC1/BC3 block compression: 4-8x less texture VRAM
 textureCompression = 1
+; keep prepared (mip-mapped, compressed) textures in the user cache: faster later loads
+textureDiskCache = 1
 ; geometry heaps (MB), shared by every object; LRU-evicted when full
 vertexHeapMB = 64
 indexHeapMB = 16
@@ -96,6 +98,20 @@ plugins = 1
 safety = auto
 ; AI trains: Route.RunInterval and <route>.traffic.json (docs/traffic.md)
 traffic = 1
+
+[sky]
+; physical sky instead of the route's background images: sun and moon from the date, time and
+; place, atmospheric scattering (sunset, twilight, night), NASA / ESA star maps (data/sky)
+enabled = 1
+; YYYY-MM-DD; empty = today
+date =
+latitude = 36.35
+longitude = 127.38
+utcOffset = 9
+; degrees: the route's +z axis is this far clockwise from north
+northAzimuth = 0
+stars = 1
+milkyWay = 1
 
 [terrain]
 ; DEM terrain from <route>.terrain.json (docs/terrain.md)

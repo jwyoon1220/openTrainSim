@@ -52,7 +52,14 @@ void main() {
     }
     if (fr.fog.z > 0.0) {
         float f = clamp((fr.fog.y - dist) / max(fr.fog.y - fr.fog.x, 1e-3), 0.0, 1.0);
-        rgb = mix(fr.fogColor.rgb, rgb, f);
+        vec3 fogC = fr.fogColor.rgb;
+        if (fr.sky.x > 0.5) {
+            // physical sky: the horizon is warmer towards the sun than away from it
+            vec2 v = normalize(vView.xz + 1e-4), s = normalize(fr.sunDir.xz + 1e-4);
+            float t = 0.5 + 0.5 * dot(v, s);
+            fogC = mix(fogC, fr.fogSun.rgb, t * t);
+        }
+        rgb = mix(fogC, rgb, f);
     }
     // openBVE "smooth" transparency: translucent materials are drawn twice — the fully opaque
     // texels here with depth writes, the rest in the sorted blend pass without.

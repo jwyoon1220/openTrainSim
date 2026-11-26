@@ -15,6 +15,7 @@ It uses the following third-party components, each under its own license. Compon
 | [AMD FidelityFX FSR 1](https://github.com/GPUOpen-Effects/FidelityFX-FSR) | 1.0.2 (fetched) | FSR upscaling | MIT |
 | [NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS) | 310.9.16 (fetched, optional: `PHX_DLSS`) | DLSS, frame generation | NVIDIA RTX SDK license (proprietary) |
 | [OpenAL Soft](https://openal-soft.org/) | system, or 1.25.2 fetched (Windows: OpenAL32.dll); dynamically linked | sound output | LGPL-2.0-or-later |
+| [tinyexr](https://github.com/syoyo/tinyexr) (with its bundled miniz) | 1.0.9 (fetched) | OpenEXR decoding (NASA star map) | BSD-3-Clause / MIT |
 | [cgltf](https://github.com/jkuhlmann/cgltf) | 1.14 (vendored: `third_party/cgltf`) | glTF 2.0 models (3D cabs) | MIT |
 | iconv (glibc) | system (Linux; Windows uses its own code page API) | legacy code page decoding | LGPL-2.1-or-later |
 | [Mono](https://www.mono-project.com/) | system (Linux: build + run time; Windows uses the .NET Framework) | train plugin host | MIT |
@@ -31,5 +32,10 @@ It uses the following third-party components, each under its own license. Compon
   `-DPHX_DLSS=OFF` removes it entirely; FSR / TAA are used instead.
 - **OpenAL Soft** is LGPL: keep it dynamically linked; if you ship its library, include its
   license and allow users to replace it.
+- **Sky maps** (downloaded by `tools/fetch_sky.sh` into `data/sky/`, not part of this
+  repository): NASA/Goddard Space Flight Center Scientific Visualization Studio, *Deep Star Maps
+  2020* (https://svs.gsfc.nasa.gov/4851), visualizations by Ernie Wright; ESA/Gaia/DPAC, *The
+  colour of the sky from Gaia's Early Data Release 3*, acknowledgement A. Moitinho, licensed
+  CC BY-SA 3.0 IGO.
 - **Content.** Routes, trains and plugins (e.g. the `data/` add-on) belong to their authors and
   are not covered by this project's license.

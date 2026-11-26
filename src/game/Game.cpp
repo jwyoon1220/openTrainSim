@@ -16,6 +16,7 @@
 #include "terrain/Terrain.hpp"
 #include "sim/World.hpp"
 #include "util/Paths.hpp"
+#include "util/Platform.hpp"
 #include "util/Text.hpp"
 #include "util/ThreadPool.hpp"
 
@@ -252,6 +253,7 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
     rset.uploadMBPerFrame = u32(cfg.getInt("render", "uploadMBPerFrame", 48));
     rset.textures.maxSize = u32(cfg.getInt("render", "textureMaxSize", 2048));
     rset.textures.compress = cfg.getBool("render", "textureCompression", true);
+    rset.textures.diskCache = cfg.getBool("render", "textureDiskCache", true);
     rset.geometry.vertexHeapMB = u32(cfg.getInt("render", "vertexHeapMB", 64));
     rset.geometry.indexHeapMB = u32(cfg.getInt("render", "indexHeapMB", 16));
     rset.geometry.keepSeconds = float(cfg.getNumber("render", "keepSeconds", 30.0));
@@ -269,6 +271,34 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
     rset.saturation = float(std::clamp(cfg.getNumber("render", "saturation", 1.1), 0.0, 2.0));
     rset.contrast = float(std::clamp(cfg.getNumber("render", "contrast", 0.2), 0.0, 1.0));
     rset.vignette = float(std::clamp(cfg.getNumber("render", "vignette", 0.12), 0.0, 1.0));
+    {
+        // physical sky (replaces openBVE background images): date, place, star maps
+        SkySettings& sky = rset.sky;
+        sky.enabled = cfg.getBool("sky", "enabled", true);
+        const std::string date = cfg.get("sky", "date");
+        if (date.empty() || !parseDate(date.c_str(), sky.date)) sky.date = today();
+        sky.place.latitude = std::clamp(cfg.getNumber("sky", "latitude", 36.35), -90.0, 90.0);
+        sky.place.longitude = cfg.getNumber("sky", "longitude", 127.38);
+        sky.place.utcOffset = cfg.getNumber("sky", "utcOffset", 9.0);
+        sky.place.northAzimuth = cfg.getNumber("sky", "northAzimuth", 0.0);
+        sky.stars = float(std::clamp(cfg.getNumber("sky", "stars", 1.0), 0.0, 100.0));
+        sky.milkyWay = float(std::clamp(cfg.getNumber("sky", "milkyWay", 1.0), 0.0, 100.0));
+        // star maps: configured path, else data/sky next to the working or executable directory
+        auto findSkyFile = [&](const char* key, const char* name) -> std::string {
+            const std::string given = cfg.get("sky", key);
+            if (!given.empty()) return given;
+            for (const std::filesystem::path& dir : {std::filesystem::path("data/sky"), executableDir() / "data/sky", executableDir() / "../data/sky"})
+                if (std::error_code ec; std::filesystem::exists(dir / name, ec)) return (dir / name).string();
+            return {};
+        };
+        sky.starMap = findSkyFile("starMap", "starmap_2020_8k.exr");
+        if (sky.starMap.empty()) sky.starMap = findSkyFile("starMap", "starmap_2020_4k.exr");
+        sky.milkyWayMap = findSkyFile("milkyWayMap", "Gaia_EDR3_flux_cartesian_4k.png");
+        if (sky.enabled)
+            log::info("Sky: {:04}-{:02}-{:02}, {:.2f}N {:.2f}E UTC{:+g}, stars: {}, Milky Way: {}", sky.date.year, sky.date.month, sky.date.day,
+                      sky.place.latitude, sky.place.longitude, sky.place.utcOffset, sky.starMap.empty() ? "none" : sky.starMap,
+                      sky.milkyWayMap.empty() ? "none" : sky.milkyWayMap);
+    }
     Renderer renderer(window, rset, lib, pool);
     renderer.pinTrain(train);
 
@@ -552,6 +582,15 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
         if (v.size() > 0 && v[0]) cc.yaw = *v[0];
         if (v.size() > 1 && v[1]) cc.pitch = *v[1];
     }
+
+    // Scripted runs: frame times after a warm-up, for the benchmark summary at the end.
+    std::vector<double> benchFrameMs;
+    double benchCpuMs = 0.0, benchGpuMs = 0.0;
+    auto benchPrev = std::chrono::steady_clock::now();
+    const long benchWarmup = opt.maxFrames > 0 ? std::min<long>(300, opt.maxFrames / 3) : 0;
+    if (opt.maxFrames > 0) benchFrameMs.reserve(std::size_t(opt.maxFrames));
+
+    // main loop
     for (long frame = 0; !window.shouldClose() && (opt.maxFrames <= 0 || frame < opt.maxFrames); ++frame) {
         if (opt.maxFrames > 0 && frame == opt.maxFrames - 3 && !opt.screenshot.empty()) renderer.requestScreenshot(opt.screenshot.string());
         if (opt.maxFrames > 0 && frame == opt.maxFrames - 3 && !opt.pick.empty()) {
@@ -879,6 +918,18 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
         if (sound.available() && opt.maxFrames > 0 && (frame % 300) == 0)
             log::info("{} @{:.0f} m {:.0f} km/h", sound.status(), sim.train->front, sim.train->speed * 3.6);
         renderer.render(sim, cam, hud, dt);
+        if (opt.maxFrames > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            if (frame >= benchWarmup) {
+                const RenderStats& s = renderer.stats();
+                benchFrameMs.push_back(std::chrono::duration<double, std::milli>(now - benchPrev).count());
+                benchCpuMs += s.cpuMs;
+                double g = 0.0;
+                for (f32 v : s.gpuMs) g += v;
+                benchGpuMs += g;
+            }
+            benchPrev = now;
+        }
         if (opt.maxFrames > 0 && frame % 1500 == 0) {
             const RenderStats& s = renderer.stats();
             log::info("[frame {}] km {:.2f} {:.0f} km/h | textures {} ({:.0f} MB) pending {} | meshes {} loading {} | geometry {:.1f} MB | "
@@ -892,6 +943,18 @@ int runGame(const LaunchOptions& opt, Config& cfg) {
         log::info("Smoke test: {} draws, {} instances, {} textures ({:.1f} MB BC vs {:.1f} MB RGBA8), geometry {:.1f} MB, VRAM {:.0f} MB",
                        s.drawCalls, s.instances, s.textureCount, s.textureBytes / 1048576.0, s.textureRawBytes / 1048576.0,
                        (s.vertexBytes + s.indexBytes) / 1048576.0, s.vramUsage / 1048576.0);
+        if (!benchFrameMs.empty()) {
+            const std::size_t n = benchFrameMs.size();
+            double total = 0.0;
+            for (double v : benchFrameMs) total += v;
+            std::vector<double> sorted = benchFrameMs;
+            std::ranges::sort(sorted);
+            const double avg = total / double(n);
+            const double p99 = sorted[std::min(n - 1, std::size_t(double(n) * 0.99))];
+            log::info("Benchmark: {} | {} frames | avg {:.2f} ms ({:.1f} fps) | 1% low {:.1f} fps | cpu {:.2f} ms | gpu {:.2f} ms | presented x{} | {}x{}",
+                      aaModeName(renderer.aaMode()), n, avg, 1000.0 / avg, 1000.0 / p99, benchCpuMs / double(n), benchGpuMs / double(n),
+                      s.presentedPerFrame, renderer.extent().width, renderer.extent().height);
+        }
     }
     return 0;
 }

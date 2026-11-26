@@ -21,6 +21,25 @@ if (WIN32)
     add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS)
 endif ()
 
+# Release / RelWithDebInfo: link-time optimisation across the engine and the game, and -O3 for
+# hot loops (gather, function scripts, glm). OTS_NATIVE tunes for the build machine's CPU.
+option(OTS_LTO "Link-time optimisation in optimised builds" ON)
+option(OTS_NATIVE "Tune for the build machine (-march=native); the binary may not run elsewhere" OFF)
+if (OTS_LTO)
+    include(CheckIPOSupported)
+    check_ipo_supported(RESULT OTS_IPO_OK OUTPUT OTS_IPO_MSG LANGUAGES C CXX)
+    if (OTS_IPO_OK)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+        set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELWITHDEBINFO ON)
+    endif ()
+endif ()
+if (NOT MSVC)
+    add_compile_options("$<$<CONFIG:Release,RelWithDebInfo>:-O3>")
+    if (OTS_NATIVE)
+        add_compile_options(-march=native)
+    endif ()
+endif ()
+
 # Engine examples / tests are not needed; DLSS (SR / DLAA / frame generation) is.
 set(PHX_DLSS ON CACHE BOOL "" FORCE)
 set(PHX_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
@@ -63,6 +82,8 @@ set(OTS_CORE_SOURCES
     src/terrain/Model.cpp
     src/terrain/Mesh.cpp
     src/terrain/Terrain.cpp
+    src/sky/Astronomy.cpp
+    src/sky/Atmosphere.cpp
     src/audio/SoundCfg.cpp
     src/audio/Vvvf.cpp
 )
@@ -77,6 +98,16 @@ endif ()
 target_compile_definitions(ots_core PUBLIC GLFW_INCLUDE_NONE)
 target_compile_options(ots_core PRIVATE ${OTS_WARNINGS})
 
+# OpenEXR decoding for the NASA star map (tinyexr + its bundled miniz, BSD-3 / MIT).
+include(FetchContent)
+FetchContent_Declare(tinyexr URL https://github.com/syoyo/tinyexr/archive/refs/tags/v1.0.9.tar.gz SOURCE_SUBDIR _none)
+FetchContent_MakeAvailable(tinyexr)
+add_library(ots_tinyexr STATIC src/sky/TinyExr.cpp ${tinyexr_SOURCE_DIR}/deps/miniz/miniz.c)
+target_include_directories(ots_tinyexr SYSTEM PUBLIC ${tinyexr_SOURCE_DIR} ${tinyexr_SOURCE_DIR}/deps/miniz)
+if (NOT MSVC)
+    target_compile_options(ots_tinyexr PRIVATE -w)
+endif ()
+
 # Renderer + game (Vulkan).
 add_library(ots_game STATIC
     src/render/TextureCache.cpp
@@ -88,6 +119,7 @@ add_library(ots_game STATIC
     src/cab/Cab.cpp
     src/game/Game.cpp)
 target_link_libraries(ots_game PUBLIC ots_core phx::engine phx::audio)
+target_link_libraries(ots_game PRIVATE ots_tinyexr)
 target_compile_options(ots_game PRIVATE ${OTS_WARNINGS})
 
 # Windows: the manifest makes UTF-8 the process code page, so the UTF-8 std::string paths used
@@ -111,7 +143,8 @@ phx_audio_executable(openTrainSim)
 
 file(GLOB OTS_SHADERS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.vert ${CMAKE_CURRENT_SOURCE_DIR}/shaders/*.frag)
 phx_add_shaders(ots_shaders SOURCES ${OTS_SHADERS} INCLUDE_DIRS ${CMAKE_CURRENT_SOURCE_DIR}/shaders
-                DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/common.glsl ${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh_body.glsl)
+                DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/shaders/common.glsl ${CMAKE_CURRENT_SOURCE_DIR}/shaders/mesh_body.glsl
+                        ${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.glsl)
 add_dependencies(openTrainSim ots_shaders)
 
 # Headless route / train / object checker: parses everything and prints statistics.

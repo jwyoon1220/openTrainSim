@@ -2,6 +2,7 @@
 #include "phx/core/Types.hpp"
 #include "phx/gpu/Vk.hpp"
 
+#include <filesystem>
 #include <string>
 
 namespace phx {
@@ -40,6 +41,13 @@ public:
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
     VmaAllocator allocator = VK_NULL_HANDLE;
+    // Shared by every pipeline creation. Persisted with usePipelineCacheFile(): later runs and
+    // pipeline rebuilds (resize, AA change) skip shader compilation.
+    VkPipelineCache pipelineCache = VK_NULL_HANDLE;
+    // Loads `file` into the cache (if it matches this GPU / driver) and saves back to it on
+    // destruction.
+    void usePipelineCacheFile(const std::filesystem::path& file);
+    void savePipelineCache() const;
 
     GpuQueue graphics; // also presents
     GpuQueue compute;
@@ -53,6 +61,7 @@ private:
     void createAllocator();
 
     VkDebugUtilsMessengerEXT messenger_ = VK_NULL_HANDLE;
+    std::filesystem::path pipelineCacheFile_;
 };
 
 } // namespace phx

@@ -22,6 +22,13 @@ struct Frame {
     vec4 shadowParams;   // x: cascades (0 = off), y: atlas texel count, z: atlas slot, w: strength
     vec4 lighting;       // x: hemisphere ambient, y: sun specular, z: unused, w: unused
     vec4 post;           // x: bloom, y: saturation, z: contrast, w: vignette
+    mat4 invViewProj;          // clip → camera-relative world
+    mat4 equatorialFromWorld;  // world direction → J2000 equatorial (3×3)
+    vec4 sunDir;               // xyz: towards the sun, w: moon lit fraction
+    vec4 moonDir;
+    vec4 sky;                  // x: physical sky on, y: exposure, z: stars, w: Milky Way (Gaia)
+    vec4 skyMaps;              // x: star map slot, y: Gaia slot, z: star map HDR scale
+    vec4 fogSun;               // physical sky: horizon (fog) colour towards the sun; fogColor = away
 };
 layout(buffer_reference, scalar) readonly buffer FrameRef { Frame f; };
 layout(buffer_reference, scalar) readonly buffer VertexRef { Vertex v[]; };

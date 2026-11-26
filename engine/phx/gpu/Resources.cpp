@@ -338,7 +338,7 @@ VkPipeline createComputePipeline(VulkanContext& ctx, const Bindless& bl, const s
     ci.stage.pName = "main";
     ci.layout = bl.pipelineLayout;
     VkPipeline p;
-    VK_CHECK(vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &ci, nullptr, &p));
+    VK_CHECK(vkCreateComputePipelines(ctx.device, ctx.pipelineCache, 1, &ci, nullptr, &p));
     vkDestroyShaderModule(ctx.device, m, nullptr);
     return p;
 }
@@ -451,7 +451,7 @@ VkPipeline createGraphicsPipeline(VulkanContext& ctx, const Bindless& bl, const 
     ci.pDynamicState = &dy;
     ci.layout = bl.pipelineLayout;
     VkPipeline p;
-    VK_CHECK(vkCreateGraphicsPipelines(ctx.device, VK_NULL_HANDLE, 1, &ci, nullptr, &p));
+    VK_CHECK(vkCreateGraphicsPipelines(ctx.device, ctx.pipelineCache, 1, &ci, nullptr, &p));
     vkDestroyShaderModule(ctx.device, vs, nullptr);
     vkDestroyShaderModule(ctx.device, fs, nullptr);
     return p;

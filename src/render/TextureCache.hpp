@@ -25,6 +25,9 @@ struct TextureSettings {
     u32 maxSize = 2048;
     bool compress = true;
     bool mipmaps = true;
+    // Keep decoded, mip-mapped, block-compressed results on disk (like a page cache): later
+    // runs skip decoding and compression entirely.
+    bool diskCache = true;
 };
 
 class TextureCache {
@@ -34,6 +37,10 @@ public:
 
     // Decodes on a worker at `priority`; an existing texture still decoding is raised to it.
     TextureId acquire(const std::string& path, bool colorKey, u8 r, u8 g, u8 b, JobPriority priority = JobPriority::View);
+    // Uncompressed, full-size image (sky maps): no block compression, `maxSize` instead of the
+    // global limit. OpenEXR files are encoded as (value / hdrScale)^(1/4) in RGBA8 so faint
+    // stars keep their range; decode with pow(c, 4) * hdrScale.
+    TextureId acquireRaw(const std::string& path, u32 maxSize, f32 hdrScale, JobPriority priority = JobPriority::Near);
     void release(TextureId id);
     // Raises a texture still decoding (or waiting for upload) to `priority`.
     void prioritize(TextureId id, JobPriority priority);
@@ -49,6 +56,8 @@ public:
     // Textures still decoding / waiting for upload at `upTo` or more urgent (a scan).
     [[nodiscard]] std::size_t pendingCount(JobPriority upTo) const;
     [[nodiscard]] std::size_t uncompressedBytes() const { return rawBytes_; }
+    // Bumped whenever a texture's state (and so a material's slot / alpha mode) can change.
+    [[nodiscard]] u64 version() const { return version_; }
 
 private:
     enum class State : u8 { Free, Decoding, Ready, Resident, Failed };
@@ -57,6 +66,8 @@ private:
         std::string path;
         bool colorKey = false;
         u8 r = 0, g = 0, b = 0;
+        u32 rawMaxSize = 0; // acquireRaw: > 0
+        f32 hdrScale = 1.0f;
         State state = State::Free;
         u32 refs = 0;
         phx::Image image;
@@ -94,6 +105,13 @@ private:
     };
     std::vector<Zombie> zombies_;
     std::size_t residentBytes_ = 0, residentCount_ = 0, pendingCount_ = 0, rawBytes_ = 0;
+    u64 version_ = 1;
+    struct RawRequest {
+        u32 maxSize = 0;
+        f32 hdrScale = 1.0f;
+        std::string key;
+    };
+    RawRequest pendingRaw_; // set by acquireRaw() around its acquire() call
 };
 
 enum class AlphaMode : u8 { Opaque, AlphaTest, Blend, Additive };
@@ -109,6 +127,8 @@ public:
     // Writes the GPU table (index = MaterialId); returns the entry count.
     u32 write(GpuMaterial* dst, u32 capacity);
     [[nodiscard]] u32 size() const { return u32(entries_.size()); }
+    // Changes whenever write() could produce different output (dirty tracking per destination).
+    [[nodiscard]] u64 version() const { return version_ + textures_.version(); }
 
 private:
     struct Entry {
@@ -120,6 +140,7 @@ private:
     std::vector<Entry> entries_;
     std::vector<MaterialId> free_;
     std::unordered_map<std::string, MaterialId> index_;
+    u64 version_ = 0;
 };
 
 } // namespace ots

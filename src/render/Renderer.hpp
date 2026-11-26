@@ -10,6 +10,7 @@
 #include "cab/Cab.hpp"
 #include "render/MeshCache.hpp"
 #include "sim/World.hpp"
+#include "sky/Atmosphere.hpp"
 
 #include "util/Profiler.hpp"
 
@@ -45,6 +46,20 @@ std::string_view aaModeKey(AaMode m); // config value
 std::optional<AaMode> parseAaMode(std::string_view s);
 inline bool isDlssMode(AaMode m) { return m >= AaMode::Dlaa; }
 
+// Physical sky replacing openBVE's background images: sun / moon from the date, time and
+// place, atmospheric scattering, star maps.
+struct SkySettings {
+    bool enabled = true;
+    CivilDate date;            // the simulation's date
+    SkyPlace place;
+    std::string starMap;       // NASA SVS Deep Star Maps 2020 (EXR, J2000 equatorial)
+    std::string milkyWayMap;   // ESA Gaia EDR3 colour map (PNG, galactic)
+    u32 starMapSize = 8192;    // texels (width)
+    f32 starMapHdrScale = 1.0f; // the 2020 maps are clipped at 1
+    f32 stars = 1.0f;          // brightness multipliers (0 = off)
+    f32 milkyWay = 1.0f;
+};
+
 struct RenderSettings {
     AaMode aa = AaMode::Msaa4;
     u32 frameGen = 0;         // generated frames per rendered frame (DLSS-G), 0 = off
@@ -71,6 +86,7 @@ struct RenderSettings {
     f32 saturation = 1.1f;   // 1 = unchanged
     f32 contrast = 0.2f;     // S-curve amount
     f32 vignette = 0.12f;
+    SkySettings sky;
 };
 
 struct CameraState {
@@ -184,6 +200,7 @@ private:
         std::array<VkSemaphore, 4> acquired{};
         phx::Buffer data;
         std::size_t materialCapacity = 0, instanceCapacity = 0;
+        u64 materialVersion = ~0ull;           // MaterialTable::version() last written here
     };
 
     void configure();          // targets + pipelines for the current mode / extent
@@ -250,7 +267,12 @@ private:
     static constexpr VkFormat kFinalFormat = VK_FORMAT_R8G8B8A8_UNORM;
     VkFormat depthFormat_ = VK_FORMAT_D32_SFLOAT;
     std::array<VkPipeline, 2> opaque_{}, blend_{}; // [double sided]
-    VkPipeline additive_ = VK_NULL_HANDLE, background_ = VK_NULL_HANDLE, tonemap_ = VK_NULL_HANDLE;
+    VkPipeline additive_ = VK_NULL_HANDLE, background_ = VK_NULL_HANDLE, tonemap_ = VK_NULL_HANDLE, sky_ = VK_NULL_HANDLE;
+    TextureId starMap_ = kNone, milkyWayMap_ = kNone;
+    bool skyMapsRequested_ = false;
+    SkyLighting skyLight_;
+    SkyPositions skyPos_;
+    double skyLightTime_ = -1e9; // sim.time of the last lighting update
     VkPipeline shadowPipe_ = VK_NULL_HANDLE;
     // sun shadows
     static constexpr u32 kCascades = 4;
@@ -277,6 +299,23 @@ private:
     glm::dvec3 camPos_{0.0};
     std::array<glm::vec4, 5> planes_;
     std::vector<Item> items_;
+    // Per-frame scratch, reused so steady-state frames allocate nothing.
+    struct Cmd {
+        const GpuDraw* draw;
+        u32 firstInstance, count;
+        f32 distance;
+        AlphaMode mode;
+        long key = 0; // back-to-front sort key (mm)
+    };
+    std::vector<Item> sortedItems_;
+    std::vector<std::pair<u32, u32>> objectGroup_; // ObjectId → (stamp, group)
+    std::vector<u32> groupStart_;
+    u32 groupStamp_ = 0;
+    std::vector<GpuInstance> scratchInstances_;
+    std::vector<Cmd> scratchOpaque_, scratchBlended_;
+    std::array<std::vector<Cmd>, kCascades> scratchShadow_;
+    std::vector<u32> scratchGroup_;
+    int backgroundIndex_ = -2;
     std::unordered_map<u32, AnimState> routeAnim_;
     std::vector<AnimState> carAnim_;
     AnimState cabAnim_;

@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <optional>
 #include <vector>
 
@@ -110,6 +112,10 @@ VulkanContext::VulkanContext(const Window& window, bool enableValidation) {
     pickPhysicalDevice();
     createDevice();
     createAllocator();
+    {
+        VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+        VK_CHECK(vkCreatePipelineCache(device, &pci, nullptr, &pipelineCache));
+    }
     log::info("GPU: {} (Vulkan {}.{}.{}), {} MiB device-local, mesh shader: {}", caps.deviceName,
               VK_API_VERSION_MAJOR(caps.apiVersion), VK_API_VERSION_MINOR(caps.apiVersion),
               VK_API_VERSION_PATCH(caps.apiVersion), caps.deviceLocalBytes >> 20, caps.meshShader ? "yes" : "no");
@@ -120,11 +126,59 @@ VulkanContext::VulkanContext(const Window& window, bool enableValidation) {
 
 VulkanContext::~VulkanContext() {
     if (device) vkDeviceWaitIdle(device);
+    if (pipelineCache) {
+        savePipelineCache();
+        vkDestroyPipelineCache(device, pipelineCache, nullptr);
+    }
     if (allocator) vmaDestroyAllocator(allocator);
     if (device) vkDestroyDevice(device, nullptr);
     if (surface) vkDestroySurfaceKHR(instance, surface, nullptr);
     if (messenger_) vkDestroyDebugUtilsMessengerEXT(instance, messenger_, nullptr);
     if (instance) vkDestroyInstance(instance, nullptr);
+}
+
+void VulkanContext::usePipelineCacheFile(const std::filesystem::path& file) {
+    pipelineCacheFile_ = file;
+    std::ifstream in(file, std::ios::binary | std::ios::ate);
+    if (!in) return;
+    const std::streamoff size = in.tellg();
+    if (size < 32) return;
+    std::vector<char> data(static_cast<std::size_t>(size));
+    in.seekg(0);
+    if (!in.read(data.data(), size)) return;
+    // header version one: length, version, vendor, device, UUID. Only feed data from this GPU and
+    // driver (drivers must reject foreign data, but not all of them are careful).
+    VkPhysicalDeviceProperties props;
+    vkGetPhysicalDeviceProperties(physicalDevice, &props);
+    u32 hdr[4];
+    std::memcpy(hdr, data.data(), sizeof(hdr));
+    if (hdr[1] != VK_PIPELINE_CACHE_HEADER_VERSION_ONE || hdr[2] != props.vendorID || hdr[3] != props.deviceID ||
+        std::memcmp(data.data() + 16, props.pipelineCacheUUID, VK_UUID_SIZE) != 0)
+        return;
+    VkPipelineCacheCreateInfo pci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    pci.initialDataSize = data.size();
+    pci.pInitialData = data.data();
+    VkPipelineCache loaded = VK_NULL_HANDLE;
+    if (vkCreatePipelineCache(device, &pci, nullptr, &loaded) != VK_SUCCESS) return;
+    vkDestroyPipelineCache(device, pipelineCache, nullptr);
+    pipelineCache = loaded;
+    log::info("Pipeline cache: {} KiB loaded", data.size() >> 10);
+}
+
+void VulkanContext::savePipelineCache() const {
+    if (pipelineCacheFile_.empty() || !pipelineCache) return;
+    std::size_t size = 0;
+    if (vkGetPipelineCacheData(device, pipelineCache, &size, nullptr) != VK_SUCCESS || !size) return;
+    std::vector<char> data(size);
+    if (vkGetPipelineCacheData(device, pipelineCache, &size, data.data()) != VK_SUCCESS) return;
+    std::error_code ec;
+    std::filesystem::create_directories(pipelineCacheFile_.parent_path(), ec);
+    const std::filesystem::path tmp = pipelineCacheFile_.string() + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out || !out.write(data.data(), std::streamsize(size))) return;
+    }
+    std::filesystem::rename(tmp, pipelineCacheFile_, ec);
 }
 
 void VulkanContext::createInstance(bool enableValidation) {

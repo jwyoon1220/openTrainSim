@@ -131,11 +131,19 @@ std::string toUtf8(std::string_view bytes, std::string_view codepage) {
 #endif
 
 std::optional<std::string> readTextFile(const std::filesystem::path& path, std::string_view fallbackCodepage) {
-    std::ifstream f(path, std::ios::binary);
+    // One sized read instead of a character-at-a-time stream iterator.
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) return std::nullopt;
-    std::string bytes((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const std::streamoff size = f.tellg();
+    if (size < 0) return std::nullopt;
+    std::string bytes(std::size_t(size), '\0');
+    f.seekg(0);
+    if (size && !f.read(bytes.data(), size)) return std::nullopt;
     const std::string_view v(bytes);
-    if (v.starts_with("\xEF\xBB\xBF")) return bytes.substr(3);
+    if (v.starts_with("\xEF\xBB\xBF")) {
+        bytes.erase(0, 3);
+        return bytes;
+    }
     if (v.starts_with("\xFF\xFE")) return toUtf8(v.substr(2), "UTF-16LE");
     if (v.starts_with("\xFE\xFF")) return toUtf8(v.substr(2), "UTF-16BE");
     if (isValidUtf8(bytes)) return bytes;
